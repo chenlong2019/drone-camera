@@ -46,6 +46,18 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
     const fallbackImagery = new Cesium.OpenStreetMapImageryProvider({
       url: 'https://a.tile.openstreetmap.org/',
     })
+    let imageryProvider = fallbackImagery
+    let hasIonImagery = false
+    if (HAS_ION_TOKEN && typeof Cesium.createWorldImageryAsync === 'function') {
+      try {
+        imageryProvider = await Cesium.createWorldImageryAsync({
+          style: Cesium.IonWorldImageryStyle?.AERIAL_WITH_LABELS,
+        })
+        hasIonImagery = true
+      } catch (error) {
+        console.warn('[drone-camera] Cesium World Imagery unavailable; using OpenStreetMap.', error)
+      }
+    }
     let terrainProvider = new Cesium.EllipsoidTerrainProvider()
     let hasIonTerrain = false
     if (HAS_ION_TOKEN && typeof Cesium.createWorldTerrainAsync === 'function') {
@@ -60,7 +72,7 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
       animation: false,
       timeline: false,
       // Ion terrain/imagery entries are only exposed when a token is configured.
-      baseLayerPicker: hasIonTerrain,
+      baseLayerPicker: hasIonTerrain || hasIonImagery,
       geocoder: false,
       homeButton: true,
       navigationHelpButton: false,
@@ -68,7 +80,7 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
       fullscreenButton: true,
       infoBox: false,
       selectionIndicator: false,
-      imageryProvider: fallbackImagery,
+      imageryProvider,
       terrainProvider,
       contextOptions: { webgl: { preserveDrawingBuffer: true } },
     })
