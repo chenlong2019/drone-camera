@@ -1,5 +1,7 @@
 import * as THREE from 'three'
 
+import type { DroneSim } from './drone-sim'
+
 /**
  * DJI Mini 4 Pro 灯光模拟。
  *
@@ -168,6 +170,38 @@ export function describeBatteryLevel(levelPercent: number): string {
   return blinkIndex === null ? `${lit} 灯常亮` : `${lit} 常亮 + 1 闪烁`
 }
 
+/**
+ * 灯语与飞行状态的对应关系(与《Mini 4 Pro 灯光说明》一致)。
+ *
+ * 纯逻辑:只读 DroneSim 真值,不碰 three,也不碰任何渲染器 —— 所以 three 的 DroneLights
+ * 与 Cesium 的机体表现层共用同一份映射,两个后端在同样飞行状态下闪一样的灯。
+ * (原先定义在 drone-fly.ts,搬到这里是为了让 Cesium 侧不必 import 整个 three 装配层。)
+ */
+export function statusPatternFor(sim: DroneSim): StatusLightKey {
+  if (sim.damaged) return 'fcError'
+  if (sim.phase === 'powerOff') return 'off'
+  switch (sim.phase) {
+    case 'selfCheck':
+      return 'selfCheck'
+    case 'warmingUp':
+      return 'sensorWarmup'
+    case 'emergency':
+      return 'fcError'
+    default:
+      break
+  }
+  if (sim.faults.imuError) return 'fcError'
+  if (sim.faults.compassError) return 'compassError'
+  if (sim.faults.rcLost) return 'rcLost'
+  if (sim.criticalBattery) return 'criticalBattery'
+  if (sim.lowBattery) return 'lowBattery'
+  if (sim.motorsOn) return 'motorRunning'
+  const source = sim.positionSource
+  if (source === 'gps') return sim.gpsBars >= 3 ? 'gnssNormal' : 'gnssWeak'
+  if (source === 'vision') return 'gnssWeak'
+  return 'attiMode'
+}
+
 /** 单颗电量灯的对外快照(给面板做 CSS 动画镜像) */
 export interface BatteryLedSnapshot {
   /** 当前帧是否点亮 */
@@ -222,7 +256,11 @@ interface Led {
 const AUTO_LIGHT_MAX_AGL_METERS = 8 // 自动模式:模拟"夜间低空降落辅助",高于此高度自动熄灭
 const AUX_SPOT_ANGLE = 0.42
 const AUX_SPOT_INTENSITY = 26
-const LED_LIGHT_INTENSITY = 0.35 // 灯珠点光源强度(轻微溢光,保持灯珠可辨)
+// 灯珠点光源强度(轻微溢光)。
+// ⚠️ 不能调大:白天场景里白色壳体被阳光照亮(线性 ~0.55),红色溢光是"加色"叠加 ——
+// 壳体亮底 + 红光 = 粉色晕,溢光越强机身越粉,红灯的观感反而越差(实测 0.35 时主体像素
+// (238,175,162) 三文鱼粉)。溢光只留一点"灯在发光"的暗示,红色信号靠灯珠本体自发光。
+const LED_LIGHT_INTENSITY = 0.12
 const LED_LIGHT_DISTANCE = 1.6
 const AUX_MODEL_LIGHT_INTENSITY = 1.6 // 模型自带 LIGHT_BottomAssist 的峰值强度
 
@@ -350,7 +388,18 @@ export class DroneLights {
     ]) {
       const sourceMesh = model.getObjectByName(spec.meshName) ?? null
       const anchor = nodeCenterLocal(spec.meshName) ?? spec.fallback
-      const material = this.createLedMaterial(2.4, ledShellMap(sourceMesh))
+      // 灯珠几何包围球 = 径向亮度梯度的中心/半径(模型灯珠网格几何烘在顶点里,包围球即灯珠本体)
+      let lightCenter: THREE.Vector3 | null = null
+      let lightRadius = 0
+      if (sourceMesh instanceof THREE.Mesh) {
+        if (!sourceMesh.geometry.boundingSphere) sourceMesh.geometry.computeBoundingSphere()
+        lightCenter = sourceMesh.geometry.boundingSphere.center.clone()
+        lightRadius = sourceMesh.geometry.boundingSphere.radius
+      }
+      // ⚠️ 强度必须配着径向梯度用:梯度边缘增益 1.0 = 目标色原样输出,
+      // 中心由梯度过曝成亮核。若在此再叠 intensity 2.4,边缘就变成 (255,91,81) 的粉红,
+      // 永远到不了目标色(双重过曝,实测踩坑)。
+      const material = this.createLedMaterial(1.0, ledShellMap(sourceMesh), lightCenter, lightRadius)
       let mesh: THREE.Object3D
       let originalMaterial: THREE.Material | null = null
       // 此刻 attachStatusToArms 尚未调用,sourceMesh.parent 就是出厂父节点
@@ -387,7 +436,14 @@ export class DroneLights {
       const meshName = `LED_BatteryCharge_0${index + 1}`
       const sourceMesh = model.getObjectByName(meshName) ?? null
       // 4 颗灯珠连排且离相机近,自发光调低避免 Bloom 过曝糊成一片
-      const material = this.createLedMaterial(0.9, ledShellMap(sourceMesh))
+      let lightCenter: THREE.Vector3 | null = null
+      let lightRadius = 0
+      if (sourceMesh instanceof THREE.Mesh) {
+        if (!sourceMesh.geometry.boundingSphere) sourceMesh.geometry.computeBoundingSphere()
+        lightCenter = sourceMesh.geometry.boundingSphere.center.clone()
+        lightRadius = sourceMesh.geometry.boundingSphere.radius
+      }
+      const material = this.createLedMaterial(0.9, ledShellMap(sourceMesh), lightCenter, lightRadius)
       let mesh: THREE.Object3D
       let originalMaterial: THREE.Material | null = null
       let anchor: THREE.Vector3
@@ -442,6 +498,8 @@ export class DroneLights {
       emissiveIntensity: 0,
       roughness: 0.5,
     })
+    // 辅助灯照明面同样用径向梯度(中心过曝亮核 + 边缘暖白),与 Cesium 版同款
+    this.installLedGradient(this.auxDiscMaterial, new THREE.Vector3(0, 0, 0), 1.15)
     this.auxDisc = new THREE.Mesh(discGeometry, this.auxDiscMaterial)
     this.auxDisc.position.set(0, auxY, auxZ)
     this.rig.add(this.auxDisc)
@@ -653,10 +711,17 @@ export class DroneLights {
    * 结果灯没亮(emissive=0)时整颗灯珠只剩近黑底色,把原模型的绿色灯罩盖成了黑疙瘩。
    *
    * emissiveIntensity 默认按"远距离可辨"的臂尖状态灯取值;近距离成排的灯珠(电池条)应调低,否则过曝糊成一片。
+   *
+   * ⚠️ 径向亮度梯度(lightCenter/lightRadius 给出时启用),与 Cesium 版 CustomShader 同款:
+   * 发光感来自"过曝亮核 + 纯色边缘"的亮度梯度,不是整体提亮 —— 整体 ×2.4 会让红通道削顶、
+   * 绿蓝分量抬升,整颗灯变粉(观感"像粉红色")。边缘强度 1.0 保持灯语目标色纯度,
+   * 中心过曝 ~3.2 倍成亮核。中心/半径取灯珠网格几何包围球(几何烘在顶点里,包围球即灯珠本体)。
    */
   private createLedMaterial(
     emissiveIntensity = 2.4,
     shellMap: THREE.Texture | null = null,
+    lightCenter: THREE.Vector3 | null = null,
+    lightRadius = 0,
   ): THREE.MeshStandardMaterial {
     const material = new THREE.MeshStandardMaterial({
       // 有原贴图 → 白底乘贴图(还原灯罩本色);模型缺网格走手放球兜底时才用暗底
@@ -670,13 +735,68 @@ export class DroneLights {
       side: THREE.DoubleSide,
       toneMapped: false,
     })
+    // 灭灯态的漫反射底色(setLed 点亮时会临时清零,熄灭时按它还原)
+    material.userData.baseColorHex = shellMap ? 0xffffff : 0x181d21
+    // 灭灯态的表面参数(setLed 点亮时会临时压平,熄灭时还原) —— 见 setLed 注释
+    material.userData.baseRoughness = material.roughness
+    material.userData.baseMetalness = material.metalness
+    if (lightCenter && lightRadius > 0) {
+      this.installLedGradient(material, lightCenter, lightRadius)
+    }
     this.disposables.push(material)
     return material
   }
 
+  /**
+   * 给自发光材质装上径向亮度梯度(过曝亮核 + 纯色边缘),状态灯/电量灯/辅助灯共用。
+   * 几何局部坐标经 varying 传入片元,与网格挂到哪个节点无关(移挂进机臂折叠节点也不受影响)。
+   */
+  private installLedGradient(
+    material: THREE.MeshStandardMaterial,
+    center: THREE.Vector3,
+    radius: number,
+  ): void {
+    const c = center.clone()
+    material.onBeforeCompile = (shader) => {
+      shader.uniforms.uLedCenter = { value: c }
+      shader.uniforms.uLedRadius = { value: radius }
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 vLedLocal;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLedLocal = position;')
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          '#include <common>',
+          '#include <common>\nvarying vec3 vLedLocal;\nuniform vec3 uLedCenter;\nuniform float uLedRadius;',
+        )
+        .replace(
+          '#include <emissivemap_fragment>',
+          [
+            '#include <emissivemap_fragment>',
+            'float ledT = clamp(length(vLedLocal - uLedCenter) / uLedRadius, 0.0, 1.0);',
+            // 中心增益 5.0(核心 ~6 倍):核心必须冲进 HDR(线性亮度 >1.0)才能被 demo 的
+            // bloom 后期管线捕获溢出光晕 —— 饱和红的亮度天然低(#ff3b30 核心线性亮度仅 ~0.79,
+            // 绿核却有 ~1.9),增益不足时红灯永远不泛光。边缘增益 1.0 仍是灯语目标色原样输出。
+            // 输出经 ACES 后核心呈白热色 + 周圈饱和红,正是真实 LED「白热芯 + 色晕」的观感。
+            'totalEmissiveRadiance *= (1.0 + 5.0 * (1.0 - ledT) * (1.0 - ledT));',
+          ].join('\n'),
+        )
+    }
+  }
+
   /** 点亮/熄灭一颗灯珠:同时驱动自发光材质与模型自带的点光源 */
   private setLed(led: Led, color: number, on: boolean): void {
-    led.material.emissive.setHex(on ? color : 0x000000)
+    const m = led.material
+    m.emissive.setHex(on ? color : 0x000000)
+    // 点亮时把 PBR 的"受光项"全部压平,只留自发光 —— 否则四路白光叠加把纯红冲成粉色:
+    //   ① 漫反射:灯罩贴图(白壳)被太阳照亮 → color=0(与 Cesium 版 material.diffuse=0 同源);
+    //   ② 高光:白色平行光在 roughness 0.4 的镜面上打出白色 specular 高光;
+    //   ③ 环境反射:demo 场景挂了 RoomEnvironment(白色房间) 环境贴图 → envMapIntensity=0;
+    //   ④ 点光源溢光保留(LED_LIGHT_INTENSITY)——那是真实 LED 打亮周围壳体的辉光,属正常观感。
+    // 熄灭时按 userData 里的出厂值还原灯罩本色。
+    m.color.setHex(on ? 0x000000 : (m.userData.baseColorHex as number))
+    m.roughness = on ? 1.0 : (m.userData.baseRoughness as number)
+    m.metalness = on ? 0.0 : (m.userData.baseMetalness as number)
+    m.envMapIntensity = on ? 0 : 1
     if (led.light) {
       led.light.intensity = on ? (led.lightIntensity ?? LED_LIGHT_INTENSITY) : 0
       if (on) led.light.color.setHex(color)

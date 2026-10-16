@@ -5,15 +5,18 @@
  * 职责边界:本文件只做"推进仿真 + 把仿真状态映射到场景与相机";飞行物理在 drone-sim、
  * 模型骨骼动画在 drone-rig,各子系统实现各归其模块。
  *
- * 对外导出 DroneFly(宿主类)、DroneFlyInitializeOptions(初始化配置)、DRONE_MODEL_URL(默认机体模型路径)、
+ * 对外导出 DroneFly(宿主类)、DroneFlyInitializeOptions(初始化配置)、DRONE_MODEL_URL(真机机体模型路径)、
  * statusPatternFor(灯语映射)、DRONE_MAX_SPEED_METERS_PER_SECOND 及相机/拍照/录像类型,并转出 drone-sim / mission-editor 的公共类型。
- * 非直觉约定:仿真用固定步长 1/60 推进、每帧只调一次 syncPose 写入场景;非 orbit 视角不得调 controls.update();拍照/录像共用云台取景相机位姿。
+ * 非直觉约定:仿真用固定步长 1/60 推进、每帧只调一次 syncPose 写入场景;非 orbit 视角不得调 controls.update();拍照/录像共用云台取景相机位姿;
+ * initialize 不传 modelUrl 时用内置「机械哈士奇」机体(createHuskyDroneModel)而非去 /models 下找文件。
  */
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import type { DronePanelHost } from './drone-control'
+import { createHuskyDroneModel } from './drone-husky-model'
 import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import type { WebGPURenderer } from 'three/webgpu'
-import { DroneLights } from './drone-lights'
+import { DroneLights, statusPatternFor } from './drone-lights'
 import type { AuxLightMode, BatteryLightMode, StatusLightKey } from './drone-lights'
 import { DroneRig, type RigPartReport } from './drone-rig'
 import { DroneRadar, type RadarAim, type RadarSnapshot } from './drone-radar'
@@ -24,21 +27,29 @@ import {
   DRONE_SPEC,
   FLIGHT_MODES,
   NEUTRAL_STICK,
+  buildMissionExport,
+  exportMissionText,
   type DroneSnapshot,
   type ChecklistItem,
   type FaultFlags,
   type FlightMode,
   type FlightPhase,
   type MissionConfig,
+  type MissionExport,
+  type MissionExportFormat,
   type MissionSnapshot,
   type MissionWaypoint,
   type SimConfig,
   type StickState,
 } from './drone-sim'
+// 仅类型:采集契约定义在 drone-capture,用 import type 引 —— 采集服务不引任何渲染实现,
+// 依赖方向始终是「后端 → 契约」单向,没有运行时循环。
+import type { CaptureCameraState, CaptureViewOverride } from './drone-capture'
 
 /**
- * 机体模型的默认 GLB 路径。
- * 该资产不随库打包,需使用方自行提供;可在 initialize({ modelUrl }) 中覆盖。
+ * 默认真机机体模型路径(DJI Mini 4 Pro 重命名版)。
+ * 资产不随库打包,需使用方自行提供 —— 所以它**不再是 initialize() 的缺省值**:
+ * 不传 modelUrl 时用的是零依赖的内置积木机体,想要真机模型就把这个常量传进去。
  */
 export const DRONE_MODEL_URL = '/models/djiair_renamed.glb'
 const DRONE_SIZE_METERS = 2.4
@@ -62,63 +73,11 @@ export type {
   SimConfig,
   StickState,
 } from './drone-sim'
+// 航线序列化(类型 + 实现)已下沉到 drone-sim(纯逻辑层):Cesium 后端复用同一份实现时,
+// 不会把 three 拖进它的运行时依赖。这里原样再导出,公共 API(`from 'drone-camera'`)不变。
+export type { MissionExport, MissionExportFormat } from './drone-sim'
+export { buildMissionExport, exportMissionText, findMissionInsertIndex, missionToCsv } from './drone-sim'
 export type { MissionDragMode, MissionEditState, MissionEditorHost } from './mission-editor'
-
-/** 航线导出格式:`json` = 完整存档(含任务参数与统计),`csv` = 纯航点表(便于贴进表格) */
-export type MissionExportFormat = 'json' | 'csv'
-
-/**
- * 航线导出数据(JSON 形态)。
- *
- * 坐标系沿用引擎内部的**局部 ENU**:原点为返航点(起飞点),x 向东、z 向南(负值即向北),
- * 单位米;高度为相对起飞点的 AGL。与面板列表里的 `E x / S z` 读数完全一致 ——
- * 想落到真实经纬度,由宿主拿到 home 的真实经纬度后自行平移。
- */
-export interface MissionExport {
-  /** 文件标识,便于导入方识别 */
-  format: 'drone-camera/mission'
-  version: number
-  /** 导出时刻(ISO 8601) */
-  exportedAt: string
-  /** 坐标约定说明(写进文件,换个工具打开也不至于误读) */
-  frame: { origin: string; unit: string; x: string; z: string; altitude: string }
-  /** 返航点(局部坐标原点) */
-  home: { x: number; z: number }
-  /** 任务参数 */
-  config: MissionConfig
-  /** 概览统计:点数 / 航程 / 预计耗时 / 高度范围 */
-  summary: {
-    points: number
-    distance: number
-    duration: number
-    altitudeMin: number
-    altitudeMax: number
-  }
-  waypoints: MissionWaypoint[]
-}
-
-/** 航点表 → CSV(不含 BOM;落盘时由调用方按需添加) */
-export function missionToCsv(waypoints: MissionWaypoint[]): string {
-  const escape = (value: string | number): string => {
-    const text = String(value)
-    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
-  }
-  const rows: Array<Array<string | number>> = [
-    ['序号', 'X(东向,m)', 'Z(南向,m)', '高度(m)', '速度(m/s,空=巡航)', '悬停(s)', '云台俯仰(度)', '动作'],
-    ...waypoints.map((waypoint, index) => [
-      index + 1,
-      waypoint.x,
-      waypoint.z,
-      waypoint.altitude,
-      waypoint.speed > 0 ? waypoint.speed : '',
-      waypoint.hoverSeconds,
-      waypoint.gimbalPitch ?? '',
-      waypoint.action === 'photo' ? '拍照' : '无动作',
-    ]),
-  ]
-  // CRLF:Excel / WPS 对它的兼容性最好
-  return `${rows.map((row) => row.map(escape).join(',')).join('\r\n')}\r\n`
-}
 
 /** 相机视角模式:orbit=观察者(轨道控制器),follow=跟随,fpv=机载(云台视角) */
 export type CameraMode = 'orbit' | 'follow' | 'fpv'
@@ -183,6 +142,17 @@ const DEFAULT_FPV_SMOOTHING = 0
  * 让"上电 → 展臂 → 桨叶张开 → 可起飞"整条流程控制在 1 秒内。
  */
 const ARM_FOLD_RATE = 9
+/**
+ * 起落架腿收放的一阶缓动速率(1/秒):2.5 ≈ 0.6 s 走完,比机臂慢半拍 ——
+ * 收腿发生在"已离地"之后,从容一点更像真机起落架。
+ */
+const LEG_DEPLOY_RATE = 2.5
+/**
+ * 起落架腿收放高度阈(米,AGL):高于收、低于放。
+ * 起飞爬过该高度开始收;降落/手动下降到该高度以下就开始放,
+ * 保证触地瞬间机足已经张开(地面静止永远是放下态,不影响触地配平)。
+ */
+const LEG_RETRACT_ALTITUDE = 0.6
 /** 拍照等待渲染的兜底时限(毫秒),超时按失败处理 */
 const PHOTO_TIMEOUT_MS = 2000
 /** 录像参数:帧率 / 码率 / 分片间隔 */
@@ -224,7 +194,8 @@ function clamp(value: number, min: number, max: number): number {
 export interface DroneFlyInitializeOptions {
   /**
    * 机体模型 GLB 地址(URL 或相对路径)。
-   * 缺省时用内置默认值 `DRONE_MODEL_URL`(`/models/djiair_renamed.glb`)。
+   * **不传 = 用内置的「积木无人机」**(程序化几何体拼出来的四轴,零资产依赖,
+   * 见 `createHuskyDroneModel`);需要真机模型时再传,例如 `DRONE_MODEL_URL`。
    * 自定义模型不必与默认模型尺寸/原点一致 —— 载入后会自动缩放到 2.4m 级、
    * 水平居中并底面对齐地面(见 normalizeModel),因此可直接传任意 glb。
    */
@@ -245,7 +216,7 @@ export interface DroneFlyInitializeOptions {
  * 每帧固定步长推进仿真(与渲染帧率解耦,时间倍速下也能保持稳定),
  * 然后只做"把仿真状态映射到三维场景"这一件事,保证画面与遥测显示的永远是同一份状态。
  */
-export class DroneFly {
+export class DroneFly implements DronePanelHost {
   camera: THREE.PerspectiveCamera | null
   scene: THREE.Scene<THREE.Object3DEventMap> | null
   renderer: WebGPURenderer | null
@@ -260,6 +231,12 @@ export class DroneFly {
   /** 辅助灯锥形光束开关;默认不显示 */
   private auxBeamVisible = false
   readonly sim = new DroneSim()
+  /**
+   * 引擎标识。DroneFly 是 three.js 实现,与 CesiumDroneAdapter 的 `engine = 'cesium'`
+   * 构成判别字段 —— 宿主用同一份 `createDroneControl({ engine })` 装配,拿到实例后
+   * 还能靠它 `if (drone.engine === 'three')` 访问引擎特有成员。
+   */
+  readonly engine = 'three' as const
   cameraMode: CameraMode = 'orbit'
   /** 云台增稳档位(见 GimbalStabilization);默认位置 + 姿态双解耦 */
   gimbalStabilization: GimbalStabilization = 'full'
@@ -267,6 +244,14 @@ export class DroneFly {
   gimbalResponse = DEFAULT_GIMBAL_RESPONSE
   /** 电子增稳强度 0~1,0 = 关闭(默认) */
   fpvSmoothing = DEFAULT_FPV_SMOOTHING
+  /**
+   * 取景**俯仰**覆盖(全景分层用,见 `setCaptureView`):非 null 时取景相机临时偏离
+   * "云台当前俯仰"。只影响取景(拍照 / 录像 / 采集快照),不动飞控与机体姿态。
+   *
+   * 这里没有水平偏航是有意的 —— 水平覆盖靠**机体原地自转**(见 `spinBodyTo`),
+   * 云台 Pan 机械行程转不出 180°(理由见 `drone-panorama` 的文件头)。
+   */
+  private captureView: CaptureViewOverride | null = null
 
   private readonly loader = new GLTFLoader()
   private groundOffsetY = 0
@@ -285,6 +270,8 @@ export class DroneFly {
   private readonly fpvQuat = new THREE.Quaternion()
   /** 姿态解耦档下,由飞控真值解出的期望相机世界朝向(不读骨骼链) */
   private readonly fpvTargetQuat = new THREE.Quaternion()
+  /** 全景成片的**固定光心**:挂点世界高度暂存(见 applyGimbalCameraPose 的 fixedCenter) */
+  private readonly captureCenter = new THREE.Vector3()
   private fpvQuatReady = false
   /** 上一帧的帧间隔(秒):拍照/录像取景帧复用,保证平滑状态连续 */
   private lastFrameDelta = 1 / 60
@@ -326,6 +313,7 @@ export class DroneFly {
   /** 录像收尾回调:UI 用它落盘(引擎不直接触发下载) */
   onRecordingReady: ((blob: Blob, seconds: number) => void) | null = null
 
+  /** 飞行总控:接管场景/相机/渲染器/控制器,装配仿真内核与机体机械 */
   constructor(
     scene: THREE.Scene<THREE.Object3DEventMap> | null,
     camera: THREE.PerspectiveCamera | null,
@@ -339,22 +327,33 @@ export class DroneFly {
   }
 
   /**
-   * 初始化无人机:加载 GLB 机体模型,装配机械 / 灯光 / 场景 / 雷达 / 编辑器各子系统并挂入场景,
+   * 初始化无人机:装配机体模型,并挂入机械 / 灯光 / 场景 / 雷达 / 编辑器各子系统,
    * 最后做一次初始同步。可重复调用前需先 dispose(本方法不自动清理旧模型)。
    *
-   * @param options.modelUrl 自定义机体 GLB 路径;缺省用 DRONE_MODEL_URL。
+   * 机体来源二选一:
+   * - `options.modelUrl` 给了 → 加载该 GLB;
+   * - 没给 → 用内置「积木无人机」(程序化几何体,零资产依赖)。
+   *
+   * @param options.modelUrl 机体 GLB 路径;缺省用内置积木机体。
+   * @param options.obstacles 场景障碍物规格(缺省用内置 7 个参考物)。
    */
   async initialize(options: DroneFlyInitializeOptions = {}): Promise<void> {
     if (!this.scene || this.destroyed) return
 
-    const modelUrl = options.modelUrl ?? DRONE_MODEL_URL
-    const gltf = await this.loader.loadAsync(modelUrl)
-    if (this.destroyed) {
-      this.disposeModel(gltf.scene)
-      return
+    // 没传模型路径就不再默认去 /models 下找一个未必存在的文件:直接用内置积木机体,
+    // 保证"零资产"环境下也能完整跑通(归一化 / 机械 / 灯光 / 雷达走的都是同一条装配路径)。
+    let model: THREE.Group
+    if (options.modelUrl) {
+      const gltf = await this.loader.loadAsync(options.modelUrl)
+      if (this.destroyed) {
+        this.disposeModel(gltf.scene)
+        return
+      }
+      model = gltf.scene
+      model.name = 'DJI Mini 4 Pro'
+    } else {
+      model = createHuskyDroneModel()
     }
-    const model = gltf.scene
-    model.name = 'DJI Mini 4 Pro'
     this.normalizeModel(model)
     // 模型已归一到"底面对齐 y=0",记录其基准高度作为地面偏移;机体高度一律加这个偏移(见 syncPose / updateCamera)
     this.groundOffsetY = model.position.y
@@ -516,6 +515,13 @@ export class DroneFly {
           armCheck.detail = '已展开'
         }
       }
+      // 起落架腿:高于阈值(且已离地)收起,低空/地面放下 —— 只有带 LEG_* 节点的
+      // 机体(哈士奇)有腿,真机 GLB 自动 no-op。迟滞靠单阈值 + 缓动天然形成。
+      const legTarget = sim.airborne && sim.position.y > LEG_RETRACT_ALTITUDE ? 0 : 1
+      const legDeploy = this.rig.legDeploy
+      this.rig.setLegDeploy(
+        legDeploy + (legTarget - legDeploy) * Math.min(1, delta * LEG_DEPLOY_RATE),
+      )
     }
 
     // 灯光:状态灯语跟随飞行状态,除非面板手动指定
@@ -660,6 +666,37 @@ export class DroneFly {
     return this.cameraMode === 'orbit'
   }
 
+  /** 直接把无人机移动到目标位置并同步观察点/朝向 */
+  flyTo(target: { x?: number; y?: number; z?: number; heading?: number; pitch?: number; roll?: number }): void {
+    const next = { ...this.sim.position }
+    if (target.x !== undefined) next.x = target.x
+    if (target.y !== undefined) next.y = Math.max(0, target.y)
+    if (target.z !== undefined) next.z = target.z
+    this.sim.position.x = next.x
+    this.sim.position.y = next.y
+    this.sim.position.z = next.z
+    if (target.heading !== undefined) this.sim.heading = target.heading
+    if (target.pitch !== undefined) this.sim.tiltPitch = clamp(target.pitch, -45, 45)
+    if (target.roll !== undefined) this.sim.tiltRoll = clamp(target.roll, -45, 45)
+    this.cameraTarget.set(this.sim.position.x, this.groundOffsetY + this.sim.position.y, this.sim.position.z)
+    if (this.controls) {
+      this.controls.target.copy(this.cameraTarget)
+      this.controls.update()
+    }
+    this.syncPose(0)
+  }
+
+  /** 直接调整镜头/云台变焦倍数(1~4x),并同步当前机载视角 */
+  zoomTo(zoom: number): void {
+    this.sim.setZoom(zoom)
+    if (this.camera && this.cameraMode !== 'orbit') {
+      if (this.camera.zoom !== this.sim.cameraZoom) {
+        this.camera.zoom = this.sim.cameraZoom
+        this.camera.updateProjectionMatrix()
+      }
+    }
+  }
+
   /**
    * 把相机摆到云台镜片位置并取云台朝向(机载视角与拍照共用):
    * 位置 = 云台挂点沿航向前移 offset,朝向 = 云台光轴(已被三轴解算锁水平)。
@@ -674,7 +711,14 @@ export class DroneFly {
    */
   private applyGimbalCameraPose(
     camera: THREE.PerspectiveCamera,
-    options: { offset?: number; zoom?: number; delta?: number } = {},
+    options: {
+      offset?: number
+      zoom?: number
+      delta?: number
+      live?: boolean
+      fixedCenter?: boolean
+      instant?: boolean
+    } = {},
   ): boolean {
     const rig = this.rig
     const ok = rig?.getGimbalCameraTransform(this.cameraScratch) ?? false
@@ -682,22 +726,42 @@ export class DroneFly {
     this.cameraScratch.updateMatrixWorld(true)
     const clearance = rig.getGimbalCameraClearance()
     const offset =
-      options.offset ?? (clearance != null ? clearance + GIMBAL_CAMERA_CLEARANCE_MARGIN : GIMBAL_CAMERA_OFFSET)
+      options.offset ??
+      (clearance != null ? clearance + GIMBAL_CAMERA_CLEARANCE_MARGIN : GIMBAL_CAMERA_OFFSET)
     const stabilized = this.gimbalStabilization === 'full'
-    const decoupled = stabilized && rig.getGimbalCameraMount(camera.position, offset)
-    if (!decoupled) {
+    // 取景俯仰:全景分层给了覆盖时用覆盖值(绝对值),否则沿用云台俯仰。
+    // ⚠️ `live`(实时机载画面)**不吃覆盖**:覆盖只属于成片。否则全景扫描每拍一张,
+    // 实时画面就被拽到那一层的俯仰再弹回来 —— 用户看到的就是"一闪一闪"(扫描时
+    // 每张取景都会暂时改角度)。水平方向本来就不在这里做手脚(靠机体自转),俯仰同样只给成片。
+    const overridePitch = options.live === true ? undefined : this.captureView?.pitch
+    const viewPitch = overridePitch ?? this.sim.gimbalPitch
+    const viewYaw = this.sim.gimbalYaw
+    // 成片光心**固定在空间中一点**(机体自转轴正上方、云台挂点高度):
+    // 拼接器的成立前提是"相机绕光心纯旋转"(见 drone-stitch 文件头)。而取景相机
+    // 平时挂在机头、还沿光轴前移一米级 —— 机体原地自转一周,光心扫出一个大圆,
+    // 对 1m 高的近地场景视差以"度"计,羽化平均直接把重叠区抹成糊(实测清晰度只剩 8.6%)。
+    // 全景扫描(captureView 非 null)时把光心钉死,这一条假设就严格成立,拼出来才是锐的。
+    const fixedCenter =
+      options.fixedCenter === true &&
+      stabilized &&
+      this.captureView !== null &&
+      rig.getGimbalCameraMount(this.captureCenter, 0, 0)
+    const decoupled =
+      !fixedCenter && stabilized && rig.getGimbalCameraMount(camera.position, offset, viewPitch)
+    if (fixedCenter) {
+      camera.position.set(this.sim.position.x, this.captureCenter.y, this.sim.position.z)
+    } else if (!decoupled) {
       this.forwardVector.set(0, 0, -1).applyQuaternion(this.cameraScratch.quaternion).normalize()
       camera.position.copy(this.cameraScratch.position).addScaledVector(this.forwardVector, offset)
     }
     // 朝向:解耦档直接取"引擎解出的期望姿态"(不经骨骼链),否则沿用云台节点世界朝向
     const oriented =
-      stabilized &&
-      rig.getGimbalCameraOrientation(this.fpvTargetQuat, this.sim.gimbalPitch, 0, this.sim.gimbalYaw)
+      stabilized && rig.getGimbalCameraOrientation(this.fpvTargetQuat, viewPitch, 0, viewYaw)
     const source = oriented ? this.fpvTargetQuat : this.cameraScratch.quaternion
     // 可选电子增稳(对相机姿态做一阶低通,滤掉残余高频微抖)
     const delta = options.delta ?? 0
     const tau = this.fpvSmoothing * FPV_SMOOTH_TAU
-    if (tau > 0 && delta > 0) {
+    if (!options.instant && tau > 0 && delta > 0) {
       if (!this.fpvQuatReady) {
         this.fpvQuat.copy(source)
         this.fpvQuatReady = true
@@ -733,6 +797,45 @@ export class DroneFly {
     if (options.smoothing !== undefined) this.fpvSmoothing = clamp(options.smoothing, 0, 1)
   }
 
+  /**
+   * 设置取景**俯仰**覆盖 —— 全景扫描(180° / 360°)按俯仰层逐张取景的入口;传 `null` 复位。
+   *
+   * ```ts
+   * fly.setCaptureView({ pitch: -15 })   // 这一张按俯视 15° 取景(替代云台俯仰)
+   * const shot = await fly.requestPhoto()
+   * fly.setCaptureView(null)             // 复位
+   * ```
+   *
+   * 语义:俯仰**替代**云台俯仰(绝对值)。只影响取景相机,机体、飞控与用户视角都不动 ——
+   * 与"稳像 = 模型不动、相机侧解耦"同一套思路。
+   *
+   * ⚠️ **没有水平偏航**是有意的:水平方向靠 `spinBodyTo` 转机体,云台 Pan 机械行程
+   * 转不出 180°(理由见 `drone-panorama` 文件头)。
+   *
+   * ⚠️ 俯仰覆盖依赖姿态解耦档(`gimbalStabilization === 'full'`,默认)。
+   * `physical` 档的相机姿态采自骨骼链(保留裸机画弧),叠加不了绝对俯仰,此时覆盖不生效。
+   * 采集侧(`drone-capture`)在每次取景后会自动复位,单独调用时记得自己收尾。
+   */
+  setCaptureView(override: CaptureViewOverride | null): void {
+    this.captureView = override ?? null
+  }
+
+  /**
+   * 让**机体原地自转**到绝对方位角 `headingDeg`(度,罗盘角);`null` 停止自转。
+   *
+   * 全景的水平网格走这条通道(见 `drone-panorama`):Mini 4 Pro 云台 Pan 只有 ±30°,
+   * 180° 视野必须靠机体自己转。转的是机身、不是相机 —— 所以 FPV 画面里的世界会跟着转,
+   * 而机体的 x/z 位置由定点保持锁住("原地"的含义)。
+   */
+  spinBodyTo(headingDeg: number | null): void {
+    this.sim.spinTo(headingDeg)
+  }
+
+  /** 机体当前方位角(度,罗盘角)—— 全景扫描用它判断"转到位了没" */
+  getBodyHeading(): number {
+    return this.sim.heading
+  }
+
   /** 记下当前相机位姿,供取景帧渲染完还原 */
   private snapshotCamera(): CameraRestore | null {
     const camera = this.camera
@@ -755,6 +858,21 @@ export class DroneFly {
       camera.updateProjectionMatrix()
     }
     camera.updateMatrixWorld(true)
+  }
+
+  /**
+   * 取景帧渲染时的场景可见性:位置标记类辅助物 + **机体自身**都退场。
+   *
+   * 辅助物(返航点光柱 / 航点光柱 / 航迹 / 地面网格)不该出现在照片里,这批早就有;
+   * 机体自身是全景**固定光心**带来的新问题 —— 光心钉在自转轴上以后,相机就在机体怀里,
+   * 机壳 / 机臂 / 桨叶会进画面,再被多张重复拼进天底。真机全景同样拍不到自己,
+   * 成片退场是干净的做法(实时画面不受影响:还原后那一帧渲的还是完整机体)。
+   */
+  private setCaptureFrameVisible(visible: boolean): void {
+    this.world?.setCaptureHelpersVisible(visible)
+    if (this.model) this.model.visible = visible
+    // 雷达波束挂在场景上(不随 model 隐藏),单独摘;恢复时按用户开关的语义还原
+    if (this.radar) this.radar.setVisible(visible ? this.radarBeamsVisible : false)
   }
 
   // ————————————————————————————— 录制帧 —————————————————————————————
@@ -785,18 +903,28 @@ export class DroneFly {
     }
     if (this.cameraMode === 'fpv') {
       // 相机此刻就在云台上(updateCamera 刚摆好):这一帧渲出来直接搬走
+      this.setCaptureFrameVisible(false)
       this.renderer.render(this.scene, camera)
+      this.setCaptureFrameVisible(true)
       context.drawImage(source, 0, 0)
       track.requestFrame()
       return
     }
     const restore = this.snapshotCamera()
-    if (!this.applyGimbalCameraPose(camera, { zoom: this.sim.cameraZoom, delta: this.lastFrameDelta })) {
+    if (
+      !this.applyGimbalCameraPose(camera, {
+        zoom: this.sim.cameraZoom,
+        delta: this.lastFrameDelta,
+        live: true,
+      })
+    ) {
       // 云台还不可用(模型没载完):这一帧没有可录内容,下一帧再说
       return
     }
     camera.updateMatrixWorld(true)
+    this.setCaptureFrameVisible(false)
     this.renderer.render(this.scene, camera)
+    this.setCaptureFrameVisible(true)
     context.drawImage(source, 0, 0)
     track.requestFrame()
     if (restore) this.restoreCamera(restore)
@@ -825,6 +953,94 @@ export class DroneFly {
     })
   }
 
+  /**
+   * 取景相机(云台镜头)的位姿与内参快照 —— 虚拟影像采集用(见 drone-capture 的
+   * `VirtualCaptureProvider`)。与 CesiumDroneAdapter.getCaptureCamera 同义。
+   *
+   * 三个要点:
+   * - 记录的是**取景相机**,不是机身 —— 云台朝向可能与机体朝向差几十度;
+   * - 位姿与拍照走**同一条取景路径**(`applyGimbalCameraPose`),只是渲到一台临时相机上,
+   *   因此不触发渲染、不动主相机、也不影响用户当前视角;
+   * - 坐标系换成库内约定的 `local-enu`(x 东 / y 北 / z 上):three 沙盒内部是
+   *   x 东 / y 上 / z 南,由 ENU 基向量在 three 世界系里的朝向构成旋转再左乘即可。
+   *
+   * 模型 / 云台未就绪时返回 null(调用方据此跳过本次采集)。
+   */
+  getCaptureCamera(): CaptureCameraState | null {
+    const rig = this.rig
+    const camera = this.camera
+    const renderer = this.renderer
+    if (!rig || !camera || !renderer) return null
+    const scratch = this.captureCamera
+    // delta 传 0:取当前真值对应的期望位姿,不参与电子增稳的低通(那会引入一帧滞后)。
+    // fixedCenter 与拍照帧同一开关:录进影像条目的光心 = 成片真正的光心(全景扫描时是固定点)
+    if (
+      !this.applyGimbalCameraPose(scratch, {
+        zoom: this.sim.cameraZoom,
+        delta: 0,
+        fixedCenter: true,
+      })
+    )
+      return null
+
+    const canvas = renderer.domElement as HTMLCanvasElement
+    const width = canvas.width
+    const height = canvas.height
+    if (!width || !height) return null
+
+    // 内参:成片用的是渲染相机的投影参数 + 取景时套上的数字变焦
+    const zoom = this.sim.cameraZoom > 0 ? this.sim.cameraZoom : 1
+    const fovY = 2 * Math.atan(Math.tan((camera.fov * Math.PI) / 360) / zoom)
+    const fy = height / 2 / Math.tan(fovY / 2)
+    const fx = fy // 像素正方
+    const fovX = 2 * Math.atan(width / (2 * fx))
+
+    // 位姿:three 世界系 → local-enu。ENU 基向量在世界系里是
+    // 东 (1,0,0) / 北 (0,0,-1) / 上 (0,1,0),三者的旋转矩阵的逆把世界向量换进 ENU。
+    const enuFromWorld = new THREE.Quaternion()
+      .setFromRotationMatrix(
+        new THREE.Matrix4().makeBasis(
+          new THREE.Vector3(1, 0, 0),
+          new THREE.Vector3(0, 0, -1),
+          new THREE.Vector3(0, 1, 0),
+        ),
+      )
+      .invert()
+    const rotation = scratch.quaternion.clone().premultiply(enuFromWorld)
+
+    const sim = this.sim
+    const toEnu = (x: number, y: number, z: number): [number, number, number] => [x, -z, y]
+    const degrees = (radians: number): number => (radians * 180) / Math.PI
+
+    return {
+      pose: {
+        position: toEnu(scratch.position.x, scratch.position.y, scratch.position.z),
+        rotation: [rotation.x, rotation.y, rotation.z, rotation.w],
+        coordinateFrame: 'local-enu',
+      },
+      intrinsics: {
+        width,
+        height,
+        fx,
+        fy,
+        cx: width / 2,
+        cy: height / 2,
+        horizontalFovDeg: degrees(fovX),
+        verticalFovDeg: degrees(fovY),
+        calibrationSource: 'known',
+      },
+      frame: { width, height },
+      drone: {
+        position: toEnu(sim.position.x, sim.position.y, sim.position.z),
+        heading: sim.heading,
+        tiltPitch: sim.tiltPitch,
+        tiltRoll: sim.tiltRoll,
+        gimbalPitch: sim.gimbalPitch,
+        gimbalYaw: sim.gimbalYaw,
+      },
+    }
+  }
+
   /** 渲染前钩子(渲染循环在 controls.update 之后、render 之前调用):本帧按云台相机取景 */
   onBeforeRender(): void {
     const request = this.photoRequest
@@ -832,7 +1048,16 @@ export class DroneFly {
     if (!request || !camera) return
     // 先记下当前位姿:取景帧渲染完立刻还原,轨道视角不会被拽到云台位置
     request.restore = this.snapshotCamera()
-    this.applyGimbalCameraPose(camera, { zoom: this.sim.cameraZoom, delta: this.lastFrameDelta })
+    // 返航点光柱 / 航迹是给用户看的位置标记,不该出现在照片里(机腹正下方的
+    // 3m 光柱离镜头只有几厘米,每一张都会带一根竖线,全景拼接后逐列复制)
+    this.setCaptureFrameVisible(false)
+    this.applyGimbalCameraPose(camera, {
+      zoom: this.sim.cameraZoom,
+      delta: this.lastFrameDelta,
+      fixedCenter: true,
+      // 静态照片必须使用元数据记录的精确姿态,不能沿用实时画面 / 录像的平滑过渡。
+      instant: true,
+    })
     camera.updateMatrixWorld(true)
   }
 
@@ -846,6 +1071,13 @@ export class DroneFly {
     // 成片才计数:sim.takePhoto 负责 photoCount +1 与事件日志(实际成像由引擎层负责,见其注释)
     if (shot) this.sim.takePhoto()
     if (request.restore) this.restoreCamera(request.restore)
+    this.setCaptureFrameVisible(true)
+    // 补渲一帧用户视角:刚才那一帧画布上留的是云台取景,直接把还原后的位姿渲回去,
+    // 观察者 / 跟随视角就不会"闪"一帧云台画面(Cesium 侧同款修法)。
+    // 走裸 render 不经宿主后期管线 —— 与录像路径同一已知差异,仅此一帧。
+    if (this.scene && this.renderer && this.camera) {
+      this.renderer.render(this.scene, this.camera)
+    }
     request.resolve(shot)
   }
 
@@ -971,8 +1203,9 @@ export class DroneFly {
     )
 
     if (this.cameraMode === 'fpv') {
-      // 相机位姿 = 云台光轴(含变焦);取景逻辑与拍照共用同一套
-      this.applyGimbalCameraPose(camera, { zoom: this.sim.cameraZoom, delta })
+      // 相机位姿 = 云台光轴(含变焦);取景逻辑与拍照共用同一套。
+      // live: 实时画面不吃"取景俯仰覆盖"(那属于成片),否则全景扫描时机载视角每拍一帧闪一下
+      this.applyGimbalCameraPose(camera, { zoom: this.sim.cameraZoom, delta, live: true })
       return
     }
 
@@ -1129,10 +1362,12 @@ export class DroneFly {
 
   // ————————————————————————————— 操作透传 —————————————————————————————
 
+  /** 写摇杆连续量(摇杆优先于键盘;松杆由飞控刹停悬停) */
   setStick(stick: Partial<StickState>): void {
     this.sim.setStick(stick)
   }
 
+  /** 摇杆立刻回中(等同松开遥控器杆) */
   resetStick(): void {
     this.sim.setStick({ ...NEUTRAL_STICK })
   }
@@ -1145,30 +1380,37 @@ export class DroneFly {
     })
   }
 
+  /** 设垂直方向指令 -1(降)~0(保持)~1(升),面板/键盘写入 */
   setVerticalDirection(direction: DroneVerticalDirection | null): void {
     this.sim.setStick({ throttle: direction === 'up' ? 1 : direction === 'down' ? -1 : 0 })
   }
 
+  /** 设偏航指令 -1(左转)~0~1(右转) */
   setRotationDirection(direction: DroneRotationDirection | null): void {
     this.sim.setStick({ yaw: direction === 'right' ? 1 : direction === 'left' ? -1 : 0 })
   }
 
+  /** 切飞行挡位:平稳 C / 普通 N / 运动 S */
   setMode(mode: FlightMode): void {
     this.sim.setMode(mode)
   }
 
+  /** 改仿真配置(限速/风/电量阈值等,立即生效) */
   setConfig(patch: Partial<SimConfig>): void {
     this.sim.config = { ...this.sim.config, ...patch }
   }
 
+  /** 注入/清除故障标志(测失效保护用) */
   setFaults(patch: Partial<FaultFlags>): void {
     this.sim.faults = { ...this.sim.faults, ...patch }
   }
 
+  /** 设机臂折叠目标 0(展开)~1(收纳),桨叶同步收拢 */
   setArmFoldTarget(fold: number): void {
     this.armFoldTarget = fold > 0.5 ? 1 : 0
   }
 
+  /** 当前机臂折叠量 0~1(插值中的实时值) */
   get armFoldTargetValue(): number {
     return this.armFoldTarget
   }
@@ -1188,14 +1430,26 @@ export class DroneFly {
     return this.armFoldTargetValue > 0.5
   }
 
+  /**
+   * 起落架腿当前是否放下(收起 = false)。
+   * 收放由飞行高度自动驱动(高于 LEG_RETRACT_ALTITUDE 收、低于放),
+   * 只有带 LEG_* 节点的机体(哈士奇)有腿,真机 GLB 恒为 true。
+   */
+  get legsDeployed(): boolean {
+    return (this.rig?.legDeploy ?? 1) > 0.5
+  }
+
+  /** 设云台俯仰角(度,范围见 DRONE_SPEC) */
   setGimbalPitch(pitch: number): void {
     this.sim.setGimbalPitch(pitch)
   }
 
+  /** 云台增量微调(度;俯仰/偏航分别给) */
   nudgeGimbal(deltaPitch: number, deltaYaw = 0): void {
     this.sim.nudgeGimbal(deltaPitch, deltaYaw)
   }
 
+  /** 清空飞行航迹 */
   clearTrail(): void {
     this.world?.clearTrail()
   }
@@ -1207,14 +1461,17 @@ export class DroneFly {
     return this.sim.startMission()
   }
 
+  /** 暂停执行中的航线(原地悬停,可再续飞) */
   pauseMission(reason?: string): boolean {
     return this.sim.pauseMission(reason)
   }
 
+  /** 续飞被暂停的航线 */
   resumeMission(): boolean {
     return this.sim.resumeMission()
   }
 
+  /** 中止航线并留在原地悬停 */
   stopMission(reason?: string): boolean {
     return this.sim.stopMission(reason)
   }
@@ -1224,14 +1481,17 @@ export class DroneFly {
     return this.sim.setMission(waypoints)
   }
 
+  /** 改航线参数(高度/速度/航向模式等,下一次起飞生效) */
   setMissionConfig(patch: Partial<MissionConfig>): void {
     this.sim.setMissionConfig(patch)
   }
 
+  /** 航线参数恢复默认 */
   resetMissionToDefault(): void {
     this.sim.resetMissionToDefault()
   }
 
+  /** 取航线只读快照(航点/Home/进度) */
   getMissionSnapshot(): MissionSnapshot {
     return this.sim.snapshot().mission
   }
@@ -1239,59 +1499,16 @@ export class DroneFly {
   /**
    * 把当前航线整理成可序列化的导出数据(只读,随时可调,执行中也行)。
    *
+   * 序列化实现已下沉到 drone-sim(纯逻辑层),Cesium 后端复用同一函数;
    * 航程按"返航点起飞 → 依次过点"的三维折线累计,耗时按每点自己的速度(0 = 巡航速度)
    * 加上到点悬停折算,和引擎执行时的口径一致。
    */
   getMissionExport(): MissionExport {
-    const waypoints = this.sim.mission.map((waypoint) => ({ ...waypoint }))
-    const config = { ...this.sim.missionConfig }
-    const home = this.sim.homePosition
-    const cruise = Math.max(0.5, config.autoSpeed)
-
-    let distance = 0
-    let duration = 0
-    let previousX = home.x
-    let previousZ = home.z
-    let previousAltitude = 0
-    let altitudeMin = Number.POSITIVE_INFINITY
-    let altitudeMax = waypoints.length ? 0 : 0
-    for (const waypoint of waypoints) {
-      const segment = Math.hypot(
-        waypoint.x - previousX,
-        waypoint.z - previousZ,
-        waypoint.altitude - previousAltitude,
-      )
-      distance += segment
-      duration += segment / Math.max(0.5, waypoint.speed > 0 ? waypoint.speed : cruise) + waypoint.hoverSeconds
-      altitudeMin = Math.min(altitudeMin, waypoint.altitude)
-      altitudeMax = Math.max(altitudeMax, waypoint.altitude)
-      previousX = waypoint.x
-      previousZ = waypoint.z
-      previousAltitude = waypoint.altitude
-    }
-
-    return {
-      format: 'drone-camera/mission',
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      frame: {
-        origin: '返航点(起飞点)',
-        unit: 'm',
-        x: '东向偏移(向东为正)',
-        z: '南向偏移(向南为正,负值表示偏北)',
-        altitude: '相对起飞点的高度(AGL)',
-      },
-      home: { x: home.x, z: home.z },
-      config,
-      summary: {
-        points: waypoints.length,
-        distance: Number(distance.toFixed(2)),
-        duration: Number(duration.toFixed(1)),
-        altitudeMin: waypoints.length ? altitudeMin : 0,
-        altitudeMax,
-      },
-      waypoints,
-    }
+    return buildMissionExport(
+      this.sim.mission.map((waypoint) => ({ ...waypoint })),
+      { ...this.sim.missionConfig },
+      this.sim.homePosition,
+    )
   }
 
   /**
@@ -1299,9 +1516,7 @@ export class DroneFly {
    * `csv` 只出航点表 —— 表头中文、CRLF 换行,Excel / WPS 双击即可打开。
    */
   exportMission(format: MissionExportFormat = 'json'): string {
-    const data = this.getMissionExport()
-    if (format === 'csv') return missionToCsv(data.waypoints)
-    return `${JSON.stringify(data, null, 2)}\n`
+    return exportMissionText(this.getMissionExport(), format)
   }
 
   /** 航点标记 / 航线折线的总显隐(不影响任务执行) */
@@ -1310,6 +1525,7 @@ export class DroneFly {
     this.world?.setMissionVisible(visible)
   }
 
+  /** 航线是否可见 */
   isMissionVisible(): boolean {
     return this.world?.isMissionVisible() ?? this.missionVisible
   }
@@ -1320,6 +1536,7 @@ export class DroneFly {
     this.world?.setMissionWaypointsVisible(visible)
   }
 
+  /** 航线航点标记是否可见 */
   isMissionWaypointsVisible(): boolean {
     return this.world?.isMissionWaypointsVisible() ?? this.missionMarkersVisible
   }
@@ -1330,8 +1547,24 @@ export class DroneFly {
     this.world?.setMissionPathVisible(visible)
   }
 
+  /** 航线路径线是否可见 */
   isMissionPathVisible(): boolean {
     return this.world?.isMissionPathVisible() ?? this.missionPathVisible
+  }
+
+  /** three 后端是本地米坐标系,没有地理坐标;经纬度切换开关因此不显示 */
+  supportsGeoCoordinates(): boolean {
+    return false
+  }
+
+  /** three 后端无经纬高:返回 null(面板始终走 XYZ 显示) */
+  getWaypointGeo(_index: number): { lon: number; lat: number; height: number } | null {
+    return null
+  }
+
+  /** three 后端是本地米坐标系,无地理锚点,经纬度编辑不可用;接口占位返回 false */
+  setWaypointGeo(_index: number, _geo: { lon: number; lat: number; height: number }): boolean {
+    return false
   }
 
   // ————————————————————————————— 场景内航点编辑 —————————————————————————————
@@ -1363,6 +1596,7 @@ export class DroneFly {
     }
   }
 
+  /** 航线编辑模式是否开启 */
   isMissionEditEnabled(): boolean {
     return this.missionEditEnabled
   }
@@ -1373,6 +1607,7 @@ export class DroneFly {
     this.world?.setMissionSelection(index)
   }
 
+  /** 当前选中的航点索引(无选中返回 null) */
   getMissionSelected(): number {
     return this.missionEditSelected
   }
@@ -1449,14 +1684,17 @@ export class DroneFly {
     }
   }
 
+  /** 取机体机械位姿报告(机臂折叠/桨叶角/云台角/起落架,调试用) */
   getRigReport(): RigPartReport[] {
     return this.rig?.parts ?? []
   }
 
+  /** 取全量真值快照(位置/姿态/电池/云台/任务…,面板与 MCP 都用它) */
   getSnapshot(): DroneSnapshot {
     return this.sim.snapshot()
   }
 
+  /** 取灯光真值快照(各灯模式/亮度/当前色) */
   getLightsSnapshot() {
     return this.lights?.getSnapshot() ?? null
   }
@@ -1472,33 +1710,40 @@ export class DroneFly {
 
   // —— 灯光手动覆盖(面板调试用) ——
 
+  /** 设状态灯灯语(覆盖默认模式,如 breathing / blink) */
   setStatusLightPattern(key: StatusLightKey): void {
     this.lightOverride = key
     this.lights?.setStatusPattern(key)
   }
 
+  /** 清除状态灯覆盖,回到按状态自动的灯语 */
   clearStatusLightOverride(): void {
     this.lightOverride = null
     this.lights?.setStatusPattern(statusPatternFor(this.sim))
   }
 
+  /** 当前状态灯覆盖(无覆盖返回 null) */
   get statusLightOverride(): StatusLightKey | null {
     return this.lightOverride
   }
 
+  /** 设电池灯模式(off / level / blink) */
   setBatteryLightMode(mode: BatteryLightMode): void {
     this.lights?.setBatteryMode(mode)
   }
 
+  /** 设电池灯亮度 0~1 */
   setBatteryLightLevel(levelPercent: number): void {
     this.sim.forceBatteryLevel(levelPercent)
     this.lights?.setBatteryLevel(levelPercent)
   }
 
+  /** 设补光灯模式(off / on / auto) */
   setAuxLightMode(mode: AuxLightMode): void {
     this.lights?.setAuxLightMode(mode)
   }
 
+  /** 销毁飞行沙盒:停渲染循环、拆面板、释放场景与渲染器 */
   destroy(): void {
     this.destroyed = true
     // 录制中直接收摊(页面卸载不触发下载)
@@ -1557,28 +1802,7 @@ export class DroneFly {
   }
 }
 
-/** 灯语与飞行状态的对应关系(与《Mini 4 Pro 灯光说明》一致) */
-export function statusPatternFor(sim: DroneSim): StatusLightKey {
-  if (sim.damaged) return 'fcError'
-  if (sim.phase === 'powerOff') return 'off'
-  switch (sim.phase) {
-    case 'selfCheck':
-      return 'selfCheck'
-    case 'warmingUp':
-      return 'sensorWarmup'
-    case 'emergency':
-      return 'fcError'
-    default:
-      break
-  }
-  if (sim.faults.imuError) return 'fcError'
-  if (sim.faults.compassError) return 'compassError'
-  if (sim.faults.rcLost) return 'rcLost'
-  if (sim.criticalBattery) return 'criticalBattery'
-  if (sim.lowBattery) return 'lowBattery'
-  if (sim.motorsOn) return 'motorRunning'
-  const source = sim.positionSource
-  if (source === 'gps') return sim.gpsBars >= 3 ? 'gnssNormal' : 'gnssWeak'
-  if (source === 'vision') return 'gnssWeak'
-  return 'attiMode'
-}
+// statusPatternFor(灯语与飞行状态的映射)已搬到 drone-lights.ts:它是纯逻辑(只读 DroneSim),
+// 不依赖 three,搬过去之后 Cesium 侧机体表现层就能直接复用,不必 import 整个 three 装配层。
+// 这里原样再导出,`@/lib` 的既有 API 与导入路径完全不变。
+export { statusPatternFor }

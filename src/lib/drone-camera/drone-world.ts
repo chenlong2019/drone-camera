@@ -128,6 +128,7 @@ export class DroneWorld {
   private readonly scene: THREE.Scene
   private readonly group = new THREE.Group()
   private readonly homeMarker = new THREE.Object3D()
+  private readonly gridHelpers: THREE.GridHelper[] = []
   private readonly obstacles: THREE.Object3D[] = []
   private readonly disposables: Array<THREE.BufferGeometry | THREE.Material | THREE.Texture> = []
   private readonly trailPositions: Float32Array
@@ -222,6 +223,7 @@ export class DroneWorld {
   readonly collisionBoxes: ObstacleBox[] = []
   readonly specs: ObstacleSpec[]
 
+  /** 构造地面世界:底板/网格/返航点标记内部建,障碍物与任务组可见性外部可切 */
   constructor(scene: THREE.Scene, specs: ObstacleSpec[] = DEFAULT_OBSTACLES) {
     this.scene = scene
     this.specs = specs
@@ -251,6 +253,7 @@ export class DroneWorld {
     coarseGrid.position.y = 0.004
     this.tintGrid(coarseGrid, 0.75)
     this.group.add(coarseGrid)
+    this.gridHelpers.push(fineGrid, coarseGrid)
 
     // —— 返航点标记:地面上一个 H 环 + 竖直光柱 ——
     const ringGeometry = new THREE.RingGeometry(1.1, 1.5, 40)
@@ -432,6 +435,7 @@ export class DroneWorld {
     }
   }
 
+  /** 清空航迹线(场景里的飞行尾迹与鹰眼图一起清) */
   clearTrail(): void {
     this.trailCount = 0
     this.lastTrailPoint.set(Number.NaN, 0, 0)
@@ -440,10 +444,38 @@ export class DroneWorld {
     }
   }
 
+  /**
+   * 航迹尾迹快照(只读):`positions` 是 x/y/z 连续排布的缓冲,前 `count * 3` 个分量有效。
+   * 鹰眼图(DroneMiniMap)靠它把已飞路径投到俯视图上;直接返回内部缓冲,调用方只读不改。
+   */
+  getTrail(): { positions: Float32Array; count: number } {
+    return { positions: this.trailPositions, count: this.trailCount }
+  }
+
+  /** 显示/隐藏全部障碍物(碰撞盒保留,只影响渲染) */
   setObstaclesVisible(visible: boolean): void {
     this.obstacles.forEach((obstacle) => {
       obstacle.visible = visible
     })
+  }
+
+  /**
+   * 采集辅助显隐 —— 拍照 / 录像取景时应临时隐藏的**场景标记**。
+   *
+   * 这些是给**用户**看的辅助图层,不是场景内容,却都长得像"竖线":
+   * 返航点光柱(3m 高,就在机腹正下方,离镜头只有几厘米)、航迹尾迹、
+   * 航点光柱(按航点高度拉到 30~40m,远看是一根从地面戳进天里的细线 + 序号牌)、
+   * 地面网格(正对镜头的那条网格线会从机脚下一直汇聚到地平线,泛光一衬就是一根
+   * 贯穿画面的亮线,转一个方位拍一张,全景里就复制出一排)。不藏起来,
+   * 每张照片都带几根竖线,全景拼接后更是逐列复制。
+   * 地面底板与障碍物是真实场景,不在其列。
+   * 调用方负责配对(隐藏后必须在同一帧内恢复),成对的调用点在 DroneFly 的取景路径里。
+   */
+  setCaptureHelpersVisible(visible: boolean): void {
+    this.homeMarker.visible = visible
+    if (this.trailLine) this.trailLine.visible = visible
+    this.missionGroup.visible = visible
+    for (const grid of this.gridHelpers) grid.visible = visible
   }
 
   /**
@@ -682,6 +714,7 @@ export class DroneWorld {
     this.applyMissionVisibility()
   }
 
+  /** 航线是否可见(只读真值,面板 200ms 轮询同步) */
   isMissionVisible(): boolean {
     return this.missionVisible
   }
@@ -692,6 +725,7 @@ export class DroneWorld {
     this.applyMissionVisibility()
   }
 
+  /** 航线航点标记是否可见 */
   isMissionWaypointsVisible(): boolean {
     return this.missionMarkersVisible
   }
@@ -702,6 +736,7 @@ export class DroneWorld {
     this.applyMissionVisibility()
   }
 
+  /** 航线路径线是否可见 */
   isMissionPathVisible(): boolean {
     return this.missionPathVisible
   }
@@ -820,6 +855,7 @@ export class DroneWorld {
     this.homeMarker.position.set(x, 0, z)
   }
 
+  /** 解散并释放场景图与几何/材质 */
   destroy(): void {
     this.scene.remove(this.group)
     this.clearMissionWaypoints()

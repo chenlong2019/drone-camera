@@ -91,6 +91,24 @@ export const FLIGHT_MODE_LIST: Array<{ key: FlightMode; label: string }> = (
   Object.keys(FLIGHT_MODES) as FlightMode[]
 ).map((key) => ({ key, label: FLIGHT_MODES[key].label }))
 
+/** 飞行速度倍率的取值区间(与面板滑杆一致):数值**本身**就是倍数,0 = 冻结、1 = 真机原速 */
+export const SPEED_SCALE_MIN = 0
+export const SPEED_SCALE_MAX = 1000
+/** 速度倍率缺省值:1 = 真机原速 */
+export const DEFAULT_SPEED_SCALE = 1
+
+/**
+ * 机身**原地自转**的默认角速度(度/秒)。
+ *
+ * 这是给"机体自己转"用的独立通道(见 `DroneSim.spinTo`):全景扫描的水平覆盖
+ * 必须靠它,靠不了云台 —— Mini 4 Pro 云台 Pan 机械行程只有 ±30°
+ * (`DRONE_SPEC.gimbalYawRange`),转不出 180°。90°/s 对齐真机全景的转速手感。
+ */
+export const BODY_SPIN_RATE_DEG = 90
+
+/** 判定"机身自转已对准目标航向"的容差(度):1 帧的转角远大于它,但航向是连续量 */
+export const BODY_SPIN_TOLERANCE_DEG = 0.5
+
 /** 飞行阶段:上电自检 → 预热 → 待机 → 起飞 → 飞行/航线 → 返航/降落 → 停桨/失效 */
 export type FlightPhase =
   | 'powerOff'
@@ -151,12 +169,7 @@ export const NEUTRAL_STICK: StickState = { throttle: 0, yaw: 0, pitch: 0, roll: 
 export type MotorPosition = 'FrontLeft' | 'FrontRight' | 'RearLeft' | 'RearRight'
 
 /** 四机臂的固定遍历顺序 */
-export const MOTOR_POSITIONS: MotorPosition[] = [
-  'FrontLeft',
-  'FrontRight',
-  'RearLeft',
-  'RearRight',
-]
+export const MOTOR_POSITIONS: MotorPosition[] = ['FrontLeft', 'FrontRight', 'RearLeft', 'RearRight']
 
 /** 故障注入:测试沙盒里用来复现各种真机异常 */
 export interface FaultFlags {
@@ -207,6 +220,16 @@ export interface SimConfig {
   rcFailsafe: 'rth' | 'hover' | 'land'
   /** 时间倍速(1 = 实时) */
   timeScale: number
+  /**
+   * 飞行速度倍率(0 ~ 1000,数值本身就是倍数;1 = 真机原速)。
+   *
+   * 与 `timeScale` 不是一回事:时间倍速是"整个仿真跑快"(电池、自检、悬停计时一起加速),
+   * 而速度倍率**只改机体自己的运动能力**,相当于换了一台"几倍速"的机器 ——
+   * 手动摇杆速度、航线巡航速度、智能返航速度、起降速率与转向角速度整体乘这个系数,
+   * 挡位表、加速度配平、倾角标定都跟着等比缩放(满舵仍是该挡位的最大倾角)。
+   * 0 = 全部速度为 0(机体不动,连自动起飞/降落也会停住)。
+   */
+  speedScale: number
   /** 上电自检时长(秒):默认 0.3,整个上电流程控制在 1 秒内 */
   selfCheckSeconds: number
   /** 传感器预热时长(秒):默认 0.28 */
@@ -226,6 +249,7 @@ export const DEFAULT_CONFIG: SimConfig = {
   criticalBatteryPercent: 10,
   rcFailsafe: 'rth',
   timeScale: 1,
+  speedScale: DEFAULT_SPEED_SCALE,
   // 上电 → 可起飞总时长(自检 + 预热)≈ 0.58 s:演示/沙盒不需要等,想恢复
   // 真机的"慢慢开机"手感把两个值调回 2.6 / 2.4 即可
   selfCheckSeconds: 0.3,
@@ -348,6 +372,188 @@ export function normalizeMissionWaypoint(source: Partial<MissionWaypoint>): Miss
   }
 }
 
+// ——————————————————————————— 航线导出(序列化) ———————————————————————————
+//
+// 这一段是**纯逻辑、零依赖**(不引 three、不碰 DOM):三套消费方共用 ——
+//   · three 后端 DroneFly.getMissionExport / exportMission(原实现在 drone-fly,后迁到此处)
+//   · Cesium 后端 CesiumDroneAdapter 的同名方法
+//   · 无头 MCP / CLI
+// 放 drone-sim 而不是 drone-fly,是为了让 Cesium 路径复用序列化时
+// **不会把 three 拖进它的运行时依赖**(drone-fly 是 three 装配层)。
+
+/** 航线导出格式 */
+export type MissionExportFormat = 'json' | 'csv'
+
+/**
+ * 航线导出数据(JSON 形态)。
+ *
+ * 坐标系沿用引擎内部的**局部 ENU**:原点为返航点(起飞点),x 向东、z 向南(负值即向北),
+ * 单位米;高度为相对起飞点的 AGL。与面板列表里的 `E x / S z` 读数完全一致 ——
+ * 想落到真实经纬度,由宿主拿到 home 的真实经纬度后自行平移。
+ */
+export interface MissionExport {
+  /** 文件标识,便于导入方识别 */
+  format: 'drone-camera/mission'
+  version: number
+  /** 导出时刻(ISO 8601) */
+  exportedAt: string
+  /** 坐标约定说明(写进文件,换个工具打开也不至于误读) */
+  frame: { origin: string; unit: string; x: string; z: string; altitude: string }
+  /** 返航点(局部坐标原点) */
+  home: { x: number; z: number }
+  /** 任务参数 */
+  config: MissionConfig
+  /** 概览统计:点数 / 航程 / 预计耗时 / 高度范围 */
+  summary: {
+    points: number
+    distance: number
+    duration: number
+    altitudeMin: number
+    altitudeMax: number
+  }
+  waypoints: MissionWaypoint[]
+}
+
+/**
+ * 由「航点 + 任务参数 + 返航点」组出导出数据(纯函数,两套渲染后端共用)。
+ *
+ * 航程按"返航点起飞 → 依次过点"的三维折线累计,耗时按每点自己的速度(0 = 巡航速度)
+ * 加上到点悬停折算,和引擎执行时的口径一致。
+ */
+export function buildMissionExport(
+  waypoints: MissionWaypoint[],
+  config: MissionConfig,
+  home: { x: number; z: number },
+): MissionExport {
+  const cruise = Math.max(0.5, config.autoSpeed)
+  let distance = 0
+  let duration = 0
+  let previousX = home.x
+  let previousZ = home.z
+  let previousAltitude = 0
+  let altitudeMin = Number.POSITIVE_INFINITY
+  let altitudeMax = waypoints.length ? 0 : 0
+  for (const waypoint of waypoints) {
+    const segment = Math.hypot(
+      waypoint.x - previousX,
+      waypoint.z - previousZ,
+      waypoint.altitude - previousAltitude,
+    )
+    distance += segment
+    duration +=
+      segment / Math.max(0.5, waypoint.speed > 0 ? waypoint.speed : cruise) +
+      waypoint.hoverSeconds
+    altitudeMin = Math.min(altitudeMin, waypoint.altitude)
+    altitudeMax = Math.max(altitudeMax, waypoint.altitude)
+    previousX = waypoint.x
+    previousZ = waypoint.z
+    previousAltitude = waypoint.altitude
+  }
+  return {
+    format: 'drone-camera/mission',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    frame: {
+      origin: '返航点(起飞点)',
+      unit: 'm',
+      x: '东向偏移(向东为正)',
+      z: '南向偏移(向南为正,负值表示偏北)',
+      altitude: '相对起飞点的高度(AGL)',
+    },
+    home: { x: home.x, z: home.z },
+    config,
+    summary: {
+      points: waypoints.length,
+      distance: Number(distance.toFixed(2)),
+      duration: Number(duration.toFixed(1)),
+      altitudeMin: waypoints.length ? altitudeMin : 0,
+      altitudeMax,
+    },
+    waypoints,
+  }
+}
+
+/** 航点表 → CSV(不含 BOM;落盘时由调用方按需添加) */
+export function missionToCsv(waypoints: MissionWaypoint[]): string {
+  const escape = (value: string | number): string => {
+    const text = String(value)
+    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+  }
+  const rows: Array<Array<string | number>> = [
+    [
+      '序号',
+      'X(东向,m)',
+      'Z(南向,m)',
+      '高度(m)',
+      '速度(m/s,空=巡航)',
+      '悬停(s)',
+      '云台俯仰(度)',
+      '动作',
+    ],
+    ...waypoints.map((waypoint, index) => [
+      index + 1,
+      waypoint.x,
+      waypoint.z,
+      waypoint.altitude,
+      waypoint.speed > 0 ? waypoint.speed : '',
+      waypoint.hoverSeconds,
+      waypoint.gimbalPitch ?? '',
+      waypoint.action === 'photo' ? '拍照' : '无动作',
+    ]),
+  ]
+  // CRLF:Excel / WPS 对它的兼容性最好
+  return `${rows.map((row) => row.map(escape).join(',')).join('\r\n')}\r\n`
+}
+
+/**
+ * 导出航线文本。`json` 是完整存档(含坐标约定、任务参数、概览统计,可再喂回 `setMission`),
+ * `csv` 只出航点表 —— 表头中文、CRLF 换行,Excel / WPS 双击即可打开。
+ */
+export function exportMissionText(
+  data: MissionExport,
+  format: MissionExportFormat = 'json',
+): string {
+  if (format === 'csv') return missionToCsv(data.waypoints)
+  return `${JSON.stringify(data, null, 2)}\n`
+}
+
+/**
+ * 新航点插到哪个位置:取"绕路最少"的那一格(three / Cesium 两个场景内编辑器共用)。
+ *
+ * 判据是插入后航线增加的长度(prev→新点→next 减去原来的 prev→next),
+ * 而不是"离哪一段最近" —— 后者在等距处会出现平手,可能把一个明明贴着前面航段的点
+ * 插到后面去,航线就绕了。最小绕路法天然没有这个歧义。
+ */
+export function findMissionInsertIndex(
+  list: MissionWaypoint[],
+  x: number,
+  z: number,
+  homeX: number,
+  homeZ: number,
+): number {
+  const distance = (fromX: number, fromZ: number, toX: number, toZ: number): number =>
+    Math.hypot(toX - fromX, toZ - fromZ)
+  let bestIndex = 0
+  let bestDetour = Number.POSITIVE_INFINITY
+  for (let index = 0; index <= list.length; index += 1) {
+    const previous = index === 0 ? null : list[index - 1]
+    const next = list[index] ?? null
+    const fromX = previous ? previous.x : homeX
+    const fromZ = previous ? previous.z : homeZ
+    const detour = next
+      ? distance(fromX, fromZ, x, z) +
+        distance(x, z, next.x, next.z) -
+        distance(fromX, fromZ, next.x, next.z)
+      : distance(fromX, fromZ, x, z) // 接到队尾:只看从上一个航点飞过去的距离
+    // 减去 1e-6 容差:浮点上打成平手时保留更靠前的插入位,避免结果抖动
+    if (detour < bestDetour - 1e-6) {
+      bestDetour = detour
+      bestIndex = index
+    }
+  }
+  return bestIndex
+}
+
 /** 航线任务的实时进度(界面轮询用) */
 export interface MissionSnapshot {
   status: MissionStatus
@@ -431,6 +637,8 @@ export interface DroneSnapshot {
   phaseLabel: string
   mode: FlightMode
   modeLabel: string
+  /** 当前生效的飞行速度倍率(0 ~ 1000,1 = 真机原速;见 SimConfig.speedScale) */
+  speedScale: number
   positionSource: PositionSource
   positionSourceLabel: string
   airborne: boolean
@@ -534,6 +742,17 @@ const lerp = (from: number, to: number, t: number): number => from + (to - from)
 const degToRad = (deg: number): number => (deg * Math.PI) / 180
 const radToDeg = (rad: number): number => (rad * 180) / Math.PI
 
+/** 方位角归一到 [0, 360):罗盘角没有负数 */
+function normalizeHeading(deg: number): number {
+  return ((deg % 360) + 360) % 360
+}
+
+/** 速度倍率的显示文案:整数直接写,小数最多两位(0.5 → "0.5×") */
+function formatSpeedScale(scale: number): string {
+  const text = Number.isInteger(scale) ? String(scale) : scale.toFixed(2).replace(/\.?0+$/, '')
+  return `${text}×`
+}
+
 /** 航向角(罗盘 0=北 90=东)对应的机头方向单位向量 */
 function headingVector(headingDeg: number): { x: number; z: number } {
   const rad = degToRad(headingDeg)
@@ -610,6 +829,12 @@ export class DroneSim {
   private tiltRollTarget = 0
   /** 偏航角速度实际值(度/秒,一阶惯性):机身有转动惯量,转速建立/消失都需要时间 */
   private yawRateCurrent = 0
+  /**
+   * 机身原地自转的目标方位角(度,绝对罗盘角);null = 没有在自转。
+   * 优先级高于摇杆偏航 —— 真机拍全景时偏航通道由飞控接管,人打杆不参与。
+   */
+  private spinHeading: number | null = null
+  private spinRateDeg = BODY_SPIN_RATE_DEG
   private batteryUsedWh = 0
   private batteryTemp = 25
   private satellites = 0
@@ -657,6 +882,8 @@ export class DroneSim {
   private missionPausedStage: MissionStage = 'idle'
   /** 任务起始时的总航程(米),仅用于进度条 */
   private missionTotalDistance = 0
+  /** 按速度倍率缩放后的挡位参数缓存(见 specFor) */
+  private scaledSpec: { mode: FlightMode; scale: number; spec: ModeSpec } | null = null
 
   // ————————————————————————————— 状态查询 —————————————————————————————
 
@@ -670,20 +897,72 @@ export class DroneSim {
     return PHASE_LABELS[this.phase]
   }
 
+  /** 是否已离地(起落架离地即算,含低空悬停) */
   get airborne(): boolean {
     // 离地 5 cm 以上且未断电才算空中(触地/未上电都不算)
     return this.position.y > 0.05 && this.phase !== 'powerOff'
   }
 
+  /** 电机是否已启动(空中为 true;停桨后回 false) */
   get motorsOn(): boolean {
     // 电机负载 >2% 视为桨叶已转动(怠速也在转)
     return this.motorLoad > 0.02
   }
 
-  get modeSpec(): ModeSpec {
-    return FLIGHT_MODES[this.mode]
+  /** 当前生效的飞行速度倍率(夹到 0 ~ 1000;非法值退回 1) */
+  get speedScale(): number {
+    const value = this.config.speedScale
+    if (!Number.isFinite(value)) return DEFAULT_SPEED_SCALE
+    return clamp(value, SPEED_SCALE_MIN, SPEED_SCALE_MAX)
   }
 
+  /**
+   * 设置飞行速度倍率(0 ~ 1000,数值即倍数)。
+   * 非有限值一律按 1(真机原速)处理 —— 面板滑杆中途可能给出空串/NaN。
+   */
+  setSpeedScale(scale: number): void {
+    const next = Number.isFinite(scale) ? clamp(scale, SPEED_SCALE_MIN, SPEED_SCALE_MAX) : 1
+    const previous = this.speedScale
+    this.config.speedScale = next
+    if (Math.abs(next - previous) < 1e-9) return
+    this.pushEvent('info', `飞行速度倍率调整为 ${formatSpeedScale(next)}`)
+  }
+
+  /**
+   * 挡位参数按速度倍率缩放后的副本。
+   *
+   * 线性速度、加速度、刹车加速度、偏航角速度一起乘系数 —— 于是"满舵 = 该挡位最大倾角"
+   * 的标定关系不变(倾角模型的阻力系数由 horizontalSpeed 反推,自动跟着缩放),
+   * 观感就是同一台机器整体快/慢了几倍;`maxTiltDeg` 是物理上限,不缩放。
+   * 结果按(挡位, 倍率)缓存,倍率不动时每帧零分配。
+   */
+  private specFor(mode: FlightMode): ModeSpec {
+    const scale = this.speedScale
+    const cached = this.scaledSpec
+    if (cached && cached.mode === mode && cached.scale === scale) return cached.spec
+    const base = FLIGHT_MODES[mode]
+    const spec: ModeSpec =
+      scale === 1
+        ? base
+        : {
+            ...base,
+            horizontalSpeed: base.horizontalSpeed * scale,
+            climbSpeed: base.climbSpeed * scale,
+            descendSpeed: base.descendSpeed * scale,
+            accel: base.accel * scale,
+            brakeAccel: base.brakeAccel * scale,
+            yawRateDeg: base.yawRateDeg * scale,
+          }
+    this.scaledSpec = { mode, scale, spec }
+    return spec
+  }
+
+  /** 当前挡位参数(已按速度倍率缩放):速度上限 / 加速度 / 偏航角速度都取自它 */
+  get modeSpec(): ModeSpec {
+    return this.specFor(this.mode)
+  }
+
+  /** 电量百分比 0~100(按真实容量积分,非线性掉电) */
   get batteryPercent(): number {
     return clamp(100 - (this.batteryUsedWh / DRONE_SPEC.batteryWh) * 100, 0, 100)
   }
@@ -791,12 +1070,14 @@ export class DroneSim {
     this.pushEvent('info', '飞行器已关机')
   }
 
+  /** 切飞行挡位:'cine' 平稳 / 'normal' 普通 / 'sport' 运动(影响限速与倾角) */
   setMode(mode: FlightMode): void {
     if (this.mode === mode) return
     this.mode = mode
     this.pushEvent('info', `切换至${FLIGHT_MODES[mode].label}`)
   }
 
+  /** 写摇杆连续量(Partial 合并;松杆由飞控刹停并定点悬停) */
   setStick(stick: Partial<StickState>): void {
     this.stick = { ...this.stick, ...stick }
   }
@@ -846,6 +1127,8 @@ export class DroneSim {
     if (!this.airborne && this.phase !== 'takingOff') return false
     if (this.phase === 'landing' || this.phase === 'emergency') return false
     this.abortMission('触发自动降落')
+    // 降落优先级高于任何自动拍摄:自转立刻停(全景扫描会因对准超时自行收尾)
+    this.spinHeading = null
     this.phase = 'landing'
     this.phaseTime = 0
     this.landingTimer = 0
@@ -860,6 +1143,7 @@ export class DroneSim {
     if (this.phase === 'rth') return false
     // 返航优先级高于航线任务:真机触发返航会同时中止未完成的航线
     this.abortMission('触发返航')
+    this.spinHeading = null
     this.phase = 'rth'
     this.phaseTime = 0
     // 已在返航高度附近(差 <0.5 m)就直接巡航,否则先爬升
@@ -871,6 +1155,7 @@ export class DroneSim {
     return true
   }
 
+  /** 取消正在执行的智能返航,转入手动飞行 */
   cancelRth(reason = '用户取消'): void {
     if (this.phase !== 'rth') return
     this.phase = 'flying'
@@ -901,6 +1186,8 @@ export class DroneSim {
     this.tiltPitch = 0
     this.tiltRoll = 0
     this.heading = 0
+    this.spinHeading = null
+    this.yawRateCurrent = 0
     this.motorLoad = 0
     this.damaged = false
     this.batteryUsedWh = 0
@@ -974,9 +1261,10 @@ export class DroneSim {
         break
       case 'takingOff': {
         this.motorLoad = lerp(this.motorLoad, 0.62, Math.min(1, delta * 3))
-        // 起飞爬升率固定 1.5 m/s
-        this.position.y = Math.min(DRONE_SPEC.takeoffAltitude, this.position.y + 1.5 * delta)
-        this.velocity.y = 1.5
+        // 起飞爬升率固定 1.5 m/s(按速度倍率缩放,0 倍率时起飞也会停住)
+        const climbRate = 1.5 * this.speedScale
+        this.position.y = Math.min(DRONE_SPEC.takeoffAltitude, this.position.y + climbRate * delta)
+        this.velocity.y = climbRate
         this.settleHorizontal(delta)
         if (this.position.y >= DRONE_SPEC.takeoffAltitude - 0.01) {
           this.position.y = DRONE_SPEC.takeoffAltitude
@@ -1022,9 +1310,11 @@ export class DroneSim {
     this.settleHorizontal(delta)
 
     if (this.landingStage === 'approach') {
-      // 低于 2 m 改用 0.6 m/s 缓降,避免贴地时下冲过猛
+      // 低于 2 m 改用 0.6 m/s 缓降,避免贴地时下冲过猛(倍率下同比例缩放)
       const rate =
-        this.position.y <= DRONE_SPEC.landingSlowAltitude ? 0.6 : this.modeSpec.descendSpeed
+        this.position.y <= DRONE_SPEC.landingSlowAltitude
+          ? 0.6 * this.speedScale
+          : this.modeSpec.descendSpeed
       this.velocity.y = -rate
       this.position.y -= rate * delta
       if (this.position.y <= LANDING_HOLD_ALTITUDE_M) {
@@ -1047,9 +1337,10 @@ export class DroneSim {
       return
     }
 
-    // 缓速触地:接触地面后停桨
-    this.velocity.y = -LANDING_FINAL_DESCENT_RATE
-    this.position.y -= LANDING_FINAL_DESCENT_RATE * delta
+    // 缓速触地:接触地面后停桨(触地速率同样吃速度倍率)
+    const finalRate = LANDING_FINAL_DESCENT_RATE * this.speedScale
+    this.velocity.y = -finalRate
+    this.position.y -= finalRate * delta
     if (this.position.y <= 0.02) {
       this.position.y = 0
       this.velocity.y = 0
@@ -1190,16 +1481,18 @@ export class DroneSim {
     this.velocity.x += clamp(targetX - this.velocity.x, -accel, accel)
     this.velocity.z += clamp(targetZ - this.velocity.z, -accel, accel)
 
-    // 垂直:GPS/视觉下松杆定高;姿态模式有轻微掉高
+    // 垂直:GPS/视觉下松杆定高;姿态模式有轻微掉高。升降的加速度限幅同样按倍率缩放
     const verticalInput = this.stick.throttle
     if (Math.abs(verticalInput) > 0.06) {
       const rate =
         verticalInput > 0 ? verticalInput * spec.climbSpeed : verticalInput * spec.descendSpeed
-      this.velocity.y += clamp(rate - this.velocity.y, -3 * delta, 3 * delta)
+      const climbAccel = 3 * this.speedScale * delta
+      this.velocity.y += clamp(rate - this.velocity.y, -climbAccel, climbAccel)
     } else {
       // 姿态模式无定高:松杆仍以 -0.35 m/s 缓慢掉高
-      const hold = source === 'atti' ? -0.35 : 0
-      this.velocity.y += clamp(hold - this.velocity.y, -2 * delta, 2 * delta)
+      const hold = source === 'atti' ? -0.35 * this.speedScale : 0
+      const holdAccel = 2 * this.speedScale * delta
+      this.velocity.y += clamp(hold - this.velocity.y, -holdAccel, holdAccel)
     }
 
     this.integratePosition(delta)
@@ -1238,9 +1531,16 @@ export class DroneSim {
   }
 
   private applyYaw(delta: number): void {
+    // 机身原地自转(全景扫描):偏航由飞控接管,摇杆让位。
+    // 位置不动、只改航向分量,所以是"原地"转 —— 这正是 180°/360° 全景补水平视野的方式。
+    const spin = this.spinHeading
+    if (spin !== null) {
+      this.yawRateCurrent = lerp(this.yawRateCurrent, 0, Math.min(1, delta * 7))
+      this.heading = this.turnToward(this.heading, spin, this.spinRateDeg * this.speedScale * delta)
+      return
+    }
     // 电机异常时偏航权限降到 70%,与下面的被动自旋叠加
-    const command =
-      this.stick.yaw * this.modeSpec.yawRateDeg * (this.faults.motorFailure ? 0.7 : 1)
+    const command = this.stick.yaw * this.modeSpec.yawRateDeg * (this.faults.motorFailure ? 0.7 : 1)
     // 偏航指令一阶惯性:机身有转动惯量,角速度建立/消失都需要一小段时间,
     // 松杆后机头还会再转一小段才停(真机手感),不会瞬间钉死在目标角速度上
     this.yawRateCurrent = lerp(this.yawRateCurrent, command, Math.min(1, delta * 7))
@@ -1339,10 +1639,7 @@ export class DroneSim {
     const rollTrim = (this.tiltRoll / maxTilt) * TRIM_MIX
 
     // 倾斜后总升力增大:1/cos θ;转速按推力的平方根折算(升力 ∝ 转速²)
-    const tiltMag = Math.min(
-      degToRad(Math.hypot(this.tiltPitch, this.tiltRoll)),
-      degToRad(80),
-    )
+    const tiltMag = Math.min(degToRad(Math.hypot(this.tiltPitch, this.tiltRoll)), degToRad(80))
     const rpmFactor = Math.sqrt(1 / Math.max(Math.cos(tiltMag), 0.15))
 
     for (const position of MOTOR_POSITIONS) {
@@ -1376,7 +1673,9 @@ export class DroneSim {
   // ————————————————————————————— 智能返航 —————————————————————————————
 
   private updateRth(delta: number): void {
-    const spec = FLIGHT_MODES.normal
+    // 返航按普通挡 N 的参数走(真机返航也是 N 挡),同样吃速度倍率
+    const spec = this.specFor('normal')
+    const yawRate = RTH_YAW_RATE_DEG * this.speedScale
     this.rthStickGrace = Math.max(0, this.rthStickGrace - delta)
     const stickMagnitude = Math.hypot(this.stick.pitch, this.stick.roll, this.stick.throttle)
     if (this.rthStickGrace <= 0 && stickMagnitude > 0.15) {
@@ -1417,14 +1716,17 @@ export class DroneSim {
           // 不带着位移一起转(否则会飞出一条弧线,航迹也对不上返航点)
           this.velocity.x = lerp(this.velocity.x, 0, Math.min(1, delta * 8))
           this.velocity.z = lerp(this.velocity.z, 0, Math.min(1, delta * 8))
-          this.heading = this.turnToward(this.heading, targetHeading, RTH_YAW_RATE_DEG * delta)
+          this.heading = this.turnToward(this.heading, targetHeading, yawRate * delta)
         } else {
-          // 接近返航点时按距离比例减速,最低 2 m/s
-          const cruiseSpeed = Math.min(spec.horizontalSpeed, Math.max(2, distance * 0.5))
+          // 接近返航点时按距离比例减速,最低 2 m/s(倍率下"最低"也跟着走)
+          const cruiseSpeed = Math.min(
+            spec.horizontalSpeed,
+            Math.max(2 * this.speedScale, distance * 0.5),
+          )
           this.velocity.x = lerp(this.velocity.x, dirX * cruiseSpeed, Math.min(1, delta * 1.6))
           this.velocity.z = lerp(this.velocity.z, dirZ * cruiseSpeed, Math.min(1, delta * 1.6))
           // 对准之后机头即航向,前进方向与机头一致
-          this.heading = this.turnToward(this.heading, targetHeading, RTH_YAW_RATE_DEG * delta)
+          this.heading = this.turnToward(this.heading, targetHeading, yawRate * delta)
         }
       }
     } else if (this.rthStage === 'descend') {
@@ -1745,30 +2047,37 @@ export class DroneSim {
     }
 
     // 机头:auto = 始终指向下一航点;fixed = 保持任务起始航向(相当于常说的"锁定航向")
+    const scale = this.speedScale
     const targetHeading = distance > 0.4 ? radToDeg(Math.atan2(dx, -dz)) : this.heading
     const desiredHeading =
       this.missionConfig.headingMode === 'auto' ? targetHeading : this.missionStartHeading
-    this.heading = this.turnToward(this.heading, desiredHeading, MISSION_YAW_RATE_DEG * delta)
+    this.heading = this.turnToward(
+      this.heading,
+      desiredHeading,
+      MISSION_YAW_RATE_DEG * scale * delta,
+    )
     const headingError = Math.abs(((desiredHeading - this.heading + 540) % 360) - 180)
 
     // 高度与水平段同时收敛
     const desiredVertical = clamp(altitudeError, -spec.descendSpeed, spec.climbSpeed)
     this.velocity.y = lerp(this.velocity.y, desiredVertical, Math.min(1, delta * 2))
 
-    const cruise = clamp(
-      waypoint.speed > 0 ? waypoint.speed : this.missionConfig.autoSpeed,
-      0.5,
-      Math.max(0.5, this.missionConfig.autoSpeed),
-    )
+    // 航点速度(m/s)与巡航速度一起吃倍率:倍率下"巡航 6 m/s"就是 6×倍率
+    const cruise =
+      clamp(
+        waypoint.speed > 0 ? waypoint.speed : this.missionConfig.autoSpeed,
+        0.5,
+        Math.max(0.5, this.missionConfig.autoSpeed),
+      ) * scale
     const aligned =
       this.missionConfig.headingMode !== 'auto' || headingError <= RTH_ALIGN_TOLERANCE_DEG
-    // 刹车距离 = v²/(2a);+0.6 m 是留出的余量
-    const brakeDistance = (cruise * cruise) / (2 * spec.brakeAccel) + 0.6
+    // 刹车距离 = v²/(2a);+0.6 m 是留出的余量(收尾速度同样按倍率缩放)
+    const brakeDistance = (cruise * cruise) / (2 * spec.brakeAccel) + 0.6 * scale
     let targetSpeed = 0
     if (aligned) {
       targetSpeed =
         !curved && distance < brakeDistance
-          ? Math.max(0.6, cruise * (distance / brakeDistance))
+          ? Math.max(0.6 * scale, cruise * (distance / brakeDistance))
           : cruise
     }
     const dirX = distance > 0.001 ? dx / distance : 0
@@ -1814,6 +2123,7 @@ export class DroneSim {
       return
     }
     const spec = this.modeSpec
+    const scale = this.speedScale
     const dx = waypoint.x - this.position.x
     const dz = waypoint.z - this.position.z
     const distance = Math.hypot(dx, dz)
@@ -1846,22 +2156,29 @@ export class DroneSim {
     if (this.missionStage === 'depart-cruise') {
       // 水平段:高度锁在首航点高度,机头朝行进方向(auto 航向模式)
       this.velocity.y = clamp(altitudeError, -spec.descendSpeed, spec.climbSpeed)
-      const cruise = clamp(
-        waypoint.speed > 0 ? waypoint.speed : this.missionConfig.autoSpeed,
-        0.5,
-        Math.max(0.5, this.missionConfig.autoSpeed),
-      )
-      // 刹车距离 = v²/(2a);+0.6 m 是留出的余量
-      const brakeDistance = (cruise * cruise) / (2 * spec.brakeAccel) + 0.6
+      const cruise =
+        clamp(
+          waypoint.speed > 0 ? waypoint.speed : this.missionConfig.autoSpeed,
+          0.5,
+          Math.max(0.5, this.missionConfig.autoSpeed),
+        ) * scale
+      // 刹车距离 = v²/(2a);+0.6 m 是留出的余量(收尾速度同样按倍率缩放)
+      const brakeDistance = (cruise * cruise) / (2 * spec.brakeAccel) + 0.6 * scale
       const targetSpeed =
-        distance < brakeDistance ? Math.max(0.4, cruise * (distance / brakeDistance)) : cruise
+        distance < brakeDistance
+          ? Math.max(0.4 * scale, cruise * (distance / brakeDistance))
+          : cruise
       const dirX = distance > 0.001 ? dx / distance : 0
       const dirZ = distance > 0.001 ? dz / distance : 0
       const desiredHeading =
         this.missionConfig.headingMode === 'auto' && distance > 0.4
           ? radToDeg(Math.atan2(dx, -dz))
           : this.missionStartHeading
-      this.heading = this.turnToward(this.heading, desiredHeading, MISSION_YAW_RATE_DEG * delta)
+      this.heading = this.turnToward(
+        this.heading,
+        desiredHeading,
+        MISSION_YAW_RATE_DEG * scale * delta,
+      )
       const steer = Math.min(1, delta * 2.2)
       this.velocity.x = lerp(this.velocity.x, dirX * targetSpeed, steer)
       this.velocity.z = lerp(this.velocity.z, dirZ * targetSpeed, steer)
@@ -1892,7 +2209,11 @@ export class DroneSim {
     const routeHeading = this.missionRouteHeading(0)
     const desiredHeading =
       this.missionConfig.headingMode === 'auto' ? routeHeading : this.missionStartHeading
-    this.heading = this.turnToward(this.heading, desiredHeading, MISSION_YAW_RATE_DEG * delta)
+    this.heading = this.turnToward(
+      this.heading,
+      desiredHeading,
+      MISSION_YAW_RATE_DEG * scale * delta,
+    )
     const headingError = Math.abs(((desiredHeading - this.heading + 540) % 360) - 180)
     if (headingError <= MISSION_DEPART_ALIGN_TOLERANCE) {
       this.position.x = waypoint.x
@@ -2062,7 +2383,8 @@ export class DroneSim {
   /** 预计剩余时间(秒):剩余航程 / 巡航速度 + 剩余悬停时间 */
   get missionEtaSeconds(): number {
     if (this.missionStatus === 'idle' || this.missionIndex < 0) return 0
-    const speed = Math.max(0.5, this.missionConfig.autoSpeed)
+    // 巡航速度同样吃倍率:倍率越高预计耗时越短(0 倍率下速度取极小值,ETA 给出一个有限的大数)
+    const speed = Math.max(0.5, this.missionConfig.autoSpeed) * Math.max(this.speedScale, 1e-3)
     let hover = 0
     for (let index = this.missionIndex; index < this.mission.length; index += 1) {
       const waypoint = this.mission[index]
@@ -2084,7 +2406,10 @@ export class DroneSim {
     if (this.satellites < target) {
       this.satellites = Math.min(target, this.satellites + this.config.gnssAcquireRate * delta)
     } else if (this.satellites > target) {
-      this.satellites = Math.max(target, this.satellites - this.config.gnssAcquireRate * 2.5 * delta)
+      this.satellites = Math.max(
+        target,
+        this.satellites - this.config.gnssAcquireRate * 2.5 * delta,
+      )
     }
 
     const visionCapable =
@@ -2107,6 +2432,7 @@ export class DroneSim {
     return clamp(1.6 - this.satellites * 0.06 + (this.faults.gnssLost ? 4 : 0), 0.5, 5)
   }
 
+  /** GPS 信号格数 0~5(按卫星数与 hdop 折算,面板显示用) */
   get gpsBars(): number {
     if (this.satellites <= 0 || this.faults.gnssLost) return 0
     if (this.satellites >= 14) return 5
@@ -2116,10 +2442,12 @@ export class DroneSim {
     return 1
   }
 
+  /** 遥控信号格数 0~5(按链路质量折算,面板显示用) */
   get rcBars(): number {
     return Math.round(clamp(this.rcLinkQuality, 0, 1) * 5)
   }
 
+  /** 距返航点水平距离(米) */
   get distanceToHome(): number {
     return Math.hypot(this.position.x - this.home.x, this.position.z - this.home.z)
   }
@@ -2127,6 +2455,11 @@ export class DroneSim {
   /** 返航点(起飞点)水平坐标 */
   get homePosition(): { x: number; z: number } {
     return { ...this.home }
+  }
+
+  /** 是否已记录返航点(起飞那一刻记下)。界面据此决定画不画 H 标记与距离读数 */
+  get homeReady(): boolean {
+    return this.homeRecorded
   }
 
   /** 面板调试用:直接把电量设成某个百分比 */
@@ -2153,10 +2486,12 @@ export class DroneSim {
     if (this.airborne) this.flightTime += delta
   }
 
+  /** 是否触发低电量(将进入智能返航) */
   get lowBattery(): boolean {
     return this.batteryPercent <= this.config.lowBatteryPercent
   }
 
+  /** 是否触发严重低电量(将强制降落) */
   get criticalBattery(): boolean {
     return this.batteryPercent <= this.config.criticalBatteryPercent
   }
@@ -2291,6 +2626,40 @@ export class DroneSim {
     }
   }
 
+  // ———————————————————————— 机身原地自转(全景) ————————————————————————
+
+  /**
+   * 让机身**原地自转**到绝对方位角 `headingDeg`(度,罗盘角);传 `null` 停止自转。
+   *
+   * 为什么需要它:Mini 4 Pro 的云台 Pan 机械行程只有 ±30°,靠云台转不出 180° 水平视野。
+   * 真机拍 180°/360° 全景是**机体原地自转**补水平、云台只做俯仰分层
+   * (见 `drone-panorama`),所以水平网格必须施加在机身上,而不是取景相机上。
+   *
+   * 只改航向:`applyYaw` 里自转优先于摇杆偏航,位置照常由定点保持锁住 —— 转的过程中
+   * 机体不位移("原地"的含义)。角速度同样吃 `speedScale`(倍率 0 时自转也停住)。
+   */
+  spinTo(headingDeg: number | null, rateDeg = BODY_SPIN_RATE_DEG): void {
+    this.spinHeading = headingDeg === null ? null : normalizeHeading(headingDeg)
+    this.spinRateDeg = rateDeg
+  }
+
+  /** 自转目标方位角(度,罗盘角);没有在自转时返回 null */
+  get spinTarget(): number | null {
+    return this.spinHeading
+  }
+
+  /** 是否正在自转(目标未清除即为是,到位后目标仍在,直到调用方 `spinTo(null)`) */
+  get spinning(): boolean {
+    return this.spinHeading !== null
+  }
+
+  /** 自转是否已对准目标(容差 0.5°;没有自转时恒为 true) */
+  get spinAligned(): boolean {
+    const target = this.spinHeading
+    if (target === null) return true
+    return Math.abs(((target - this.heading + 540) % 360) - 180) <= BODY_SPIN_TOLERANCE_DEG
+  }
+
   // ————————————————————————————— 云台 / 相机 —————————————————————————————
 
   /** 手动云台俯仰增量(度),正 = 抬头 */
@@ -2317,6 +2686,7 @@ export class DroneSim {
     this.gimbalYaw = lerp(this.gimbalYaw, 0, Math.min(1, delta * 1.2))
   }
 
+  /** 切换录像开关;返回切换后是否在录 */
   toggleRecording(): void {
     this.setRecordingState(!this.recording)
   }
@@ -2338,6 +2708,7 @@ export class DroneSim {
     }
   }
 
+  /** 停止录像并收尾成片(已在录才有效) */
   stopRecording(): void {
     this.setRecordingState(false)
   }
@@ -2462,6 +2833,7 @@ export class DroneSim {
     }
   }
 
+  /** 追加一条事件(面板事件流;level 决定颜色) */
   pushEvent(level: EventLevel, text: string): void {
     this.pushEventInternal(level, text)
   }
@@ -2511,6 +2883,7 @@ export class DroneSim {
       phaseLabel: this.phaseLabel,
       mode: this.mode,
       modeLabel: this.modeSpec.label,
+      speedScale: this.speedScale,
       positionSource: this.positionSource,
       positionSourceLabel: POSITION_SOURCE_LABELS[this.positionSource],
       airborne: this.airborne,

@@ -12,7 +12,7 @@
  *
  * 设计边界:
  * - 只用原生 DOM / CSS,不引入任何 UI 框架(库整体与框架无关,Vue / React / 裸页面通用);
- * - 面板不持有状态:渲染时从 `DroneFly` 读快照,操作时调 `DroneFly` 方法,真值永远以引擎为准
+ * - 面板不持有状态:渲染时从宿主(`MissionPanelHost`)读快照,操作时调宿主方法,真值永远以引擎为准
  *   (见 sync)。宿主用别的方式改了航线,面板下一轮同步就会跟上;
  * - 样式默认注入一份(类名统一 `dmp-` 前缀、配色走 CSS 变量),可用 `injectStyles:false` 关闭。
  *
@@ -22,8 +22,8 @@
  *   与 firstapp 里"草稿行"要解决的是同一个问题,这里用"聚焦即不覆盖"更省一层状态;
  * - 航点列表只在**数量变化**时重建 DOM,其余情况原位更新,避免每轮同步都打断正在编辑的输入框;
  * - 航线执行中航点列表整体 disabled(与真机"航线上传后不可修改"一致);**导出是只读操作,执行中照常可用**;
- * - 导出走 `DroneFly.exportMission()`,面板只负责落盘(或交给宿主的 `onExport`),序列化逻辑留在引擎侧。
- * - 场景内编辑另有硬门槛:需处于观察者视角且航线未在执行,由 `DroneFly` 侧判定,面板只展示结果。
+ * - 导出走宿主的 `exportMission()`,面板只负责落盘(或交给宿主的 `onExport`),序列化逻辑留在引擎侧。
+ * - 场景内编辑另有硬门槛:需处于观察者视角且航线未在执行,由宿主判定,面板只展示结果。
  */
 import { MISSION_STATUS_LABELS, isMissionDepartStage } from './drone-sim'
 import type {
@@ -33,7 +33,10 @@ import type {
   MissionStage,
   MissionWaypoint,
 } from './drone-sim'
-import type { DroneFly, MissionExportFormat } from './drone-fly'
+// 面板只依赖 DronePanelHost 同款的 MissionPanelHost 接口:three 的 DroneFly 与
+// CesiumDroneAdapter 都满足它,换渲染后端时本文件一行都不用改(见 drone-control.ts)。
+import type { MissionPanelHost } from './drone-control'
+import type { MissionExportFormat } from './drone-sim'
 import type { MissionEditState } from './mission-editor'
 
 /** 面板停靠位置(相对挂载容器) */
@@ -68,6 +71,12 @@ export interface MissionPanelOptions {
   sceneEdit?: boolean
   /** 是否启用移动端自适应(窄屏紧凑布局),默认 true */
   adaptive?: boolean
+  /**
+   * 停靠微调(像素),与 DroneCapturePanel 同语义:y 对 top 方位= marginTop(下移)、
+   * 对 bottom 方位= marginBottom(上移);x 对 right 方位= marginRight(左移)、其余= marginLeft。
+   * 用来避开宿主自己的边角 UI(如 Cesium 的工具条 / 其他面板)。
+   */
+  offset?: { x?: number; y?: number }
   /**
    * 「导出航线」的回调。**给了就由宿主接管保存**(上传服务器 / 写数据库 / 自定义文件名),
    * 面板不再触发浏览器下载;不给则默认下载到本地(JSON / CSV,文件名带时间戳)。
@@ -132,9 +141,13 @@ function ensureStyles(): void {
  * 航线规划面板:航点任务的规划 / 执行 / 场景内编辑。
  *
  * ```ts
- * const fly = new DroneFly(scene, camera, renderer, controls)
- * await fly.initialize({ modelUrl: '/models/dji_mini4_pro.glb' })
+ * // three 后端(自带了场景,初始化后即是 MissionPanelHost)
+ * const fly = await createDroneControl({ engine: 'three', scene, camera, renderer, controls })
  * const mission = new MissionPanel(fly, { container: viewportEl, position: 'top-left' })
+ *
+ * // Cesium 后端同理:适配器实现同一个 MissionPanelHost,面板代码完全一样
+ * const adapter = await createDroneControl({ engine: 'cesium', viewer, lon: 116.391, lat: 39.906 })
+ * const mission2 = new MissionPanel(adapter, { container: viewportEl, position: 'top-right' })
  * // 卸载:mission.destroy()
  * ```
  */
@@ -142,7 +155,7 @@ export class MissionPanel {
   /** 面板根元素(宿主可追加类名做二次定制) */
   readonly root: HTMLDivElement
 
-  private readonly fly: DroneFly
+  private readonly fly: MissionPanelHost
   private readonly opts: MissionPanelOptions
   private readonly container: HTMLElement
   private readonly abort = new AbortController()
@@ -152,6 +165,10 @@ export class MissionPanel {
   /** 上一次构建航点列表时的航点数:变了才重建 DOM,否则原位更新(不打断输入) */
   private lastWaypointCount = -1
   private speedDragging = false
+  /** 坐标显示模式:xyz = 本地米(E/S 偏移),geo = 经纬高(由支持的后端提供) */
+  private coordMode: 'xyz' | 'geo' = 'xyz'
+  /** 后端是否支持地理坐标(是否渲染"经纬度 / XYZ"切换开关) */
+  private readonly geoSupported: boolean
 
   private readonly refs: {
     status: HTMLElement
@@ -189,7 +206,8 @@ export class MissionPanel {
     showPath: HTMLInputElement
   } | null
 
-  constructor(fly: DroneFly, options: MissionPanelOptions = {}) {
+  /** 构造航线编辑面板(航点列表/参数/执行控制,200ms 同步真值) */
+  constructor(fly: MissionPanelHost, options: MissionPanelOptions = {}) {
     if (typeof document === 'undefined') {
       throw new Error('[drone-camera] MissionPanel 需要浏览器环境(document),Node 侧请勿实例化')
     }
@@ -197,6 +215,7 @@ export class MissionPanel {
     this.opts = options
     this.container = options.container ?? document.body
     this.visible = options.visible ?? true
+    this.geoSupported = fly.supportsGeoCoordinates()
 
     if (options.injectStyles !== false) ensureStyles()
 
@@ -210,6 +229,16 @@ export class MissionPanel {
     this.root.dataset.position = options.position ?? 'top-left'
     this.root.dataset.adaptive = String(options.adaptive !== false)
     this.root.style.position = layerPosition
+    // 停靠微调用 margin:与 position 类里的 top/left/bottom/right 是两套独立机制,互不覆盖
+    const offset = options.offset ?? {}
+    if (offset.y) {
+      const key = this.root.dataset.position.startsWith('bottom') ? 'marginBottom' : 'marginTop'
+      this.root.style[key] = `${offset.y}px`
+    }
+    if (offset.x) {
+      const key = this.root.dataset.position.endsWith('right') ? 'marginRight' : 'marginLeft'
+      this.root.style[key] = `${offset.x}px`
+    }
     this.root.innerHTML = this.template()
     if (!this.visible) this.root.style.display = 'none'
 
@@ -231,8 +260,12 @@ export class MissionPanel {
       add: this.query<HTMLButtonElement>('[data-action="waypoint-add"]'),
       preset: this.query<HTMLButtonElement>('[data-action="waypoint-preset"]'),
       clear: this.query<HTMLButtonElement>('[data-action="waypoint-clear"]'),
-      exportJson: this.query<HTMLButtonElement>('[data-action="waypoint-export"][data-format="json"]'),
-      exportCsv: this.query<HTMLButtonElement>('[data-action="waypoint-export"][data-format="csv"]'),
+      exportJson: this.query<HTMLButtonElement>(
+        '[data-action="waypoint-export"][data-format="json"]',
+      ),
+      exportCsv: this.query<HTMLButtonElement>(
+        '[data-action="waypoint-export"][data-format="csv"]',
+      ),
       lockHint: this.query('[data-role="waypoint-lock"]'),
     }
 
@@ -248,7 +281,9 @@ export class MissionPanel {
             '[data-action="scene-select-first"]',
           )!,
           deselect: sceneCard.querySelector<HTMLButtonElement>('[data-action="scene-deselect"]')!,
-          showWaypoints: sceneCard.querySelector<HTMLInputElement>('[data-role="toggle-waypoints"]')!,
+          showWaypoints: sceneCard.querySelector<HTMLInputElement>(
+            '[data-role="toggle-waypoints"]',
+          )!,
           showPath: sceneCard.querySelector<HTMLInputElement>('[data-role="toggle-path"]')!,
         }
       : null
@@ -428,6 +463,7 @@ export class MissionPanel {
 
         <section class="dmp-card">
           <div class="dmp-card-head"><span>航点列表</span><em data-role="waypoint-count">0 个</em></div>
+          ${this.coordModeTemplate()}
           <fieldset class="dmp-wp-fieldset" data-role="waypoint-fieldset">
             <ul class="dmp-wp-list" data-role="waypoint-list"></ul>
           </fieldset>
@@ -447,6 +483,16 @@ export class MissionPanel {
         ${this.sceneEditTemplate()}
       </div>
     `
+  }
+
+  /** 坐标显示模式切换段:后端支持地理坐标(Cesium)时出现,否则整段不渲染 */
+  private coordModeTemplate(): string {
+    if (!this.geoSupported) return ''
+    return `
+      <div class="dmp-seg dmp-seg-2 dmp-coord-mode" data-blk="coord-mode">
+        <button type="button" data-action="coord-mode" data-value="xyz" class="is-active">XYZ</button>
+        <button type="button" data-action="coord-mode" data-value="geo">经纬度</button>
+      </div>`
   }
 
   /** 「场景内编辑」区块;sceneEdit:false 时整块不渲染 */
@@ -481,11 +527,23 @@ export class MissionPanel {
     `
   }
 
-  /** 单个航点行的 DOM(结构固定,值由 syncRows 原位写入) */
+  /** 单个航点行的 DOM(结构固定,值由 syncRows 原位写入);首行按坐标模式在 XYZ / 经纬高之间切换 */
   private rowTemplate(index: number): string {
     const actions = WAYPOINT_ACTIONS.map(
       (item) => `<option value="${item.key}">${item.label}</option>`,
     ).join('')
+    const firstRow =
+      this.coordMode === 'geo'
+        ? `<div class="dmp-wp-row dmp-wp-row-geo">
+            <label class="dmp-wp-field"><span>经度</span><input class="dmp-wp-input" type="number" step="0.00000001" data-field="lon" /></label>
+            <label class="dmp-wp-field"><span>纬度</span><input class="dmp-wp-input" type="number" step="0.00000001" data-field="lat" /></label>
+            <label class="dmp-wp-field dmp-wp-geo-h"><span>高度</span><input class="dmp-wp-input" type="number" step="0.1" data-field="geoHeight" /></label>
+          </div>`
+        : `<div class="dmp-wp-row">
+            <label class="dmp-wp-field"><span>X</span><input class="dmp-wp-input" type="number" step="2" data-field="x" /></label>
+            <label class="dmp-wp-field"><span>Z</span><input class="dmp-wp-input" type="number" step="2" data-field="z" /></label>
+            <label class="dmp-wp-field"><span>高度</span><input class="dmp-wp-input" type="number" step="1" min="1" data-field="altitude" /></label>
+          </div>`
     return `
       <li class="dmp-wp" data-index="${index}" data-action="waypoint-select">
         <div class="dmp-wp-head">
@@ -493,11 +551,7 @@ export class MissionPanel {
           <span class="dmp-wp-coord" data-role="wp-coord"></span>
           <button type="button" class="dmp-mini" data-action="waypoint-remove">删除</button>
         </div>
-        <div class="dmp-wp-row">
-          <label class="dmp-wp-field"><span>X</span><input class="dmp-wp-input" type="number" step="2" data-field="x" /></label>
-          <label class="dmp-wp-field"><span>Z</span><input class="dmp-wp-input" type="number" step="2" data-field="z" /></label>
-          <label class="dmp-wp-field"><span>高度</span><input class="dmp-wp-input" type="number" step="1" min="1" data-field="altitude" /></label>
-        </div>
+        ${firstRow}
         <div class="dmp-wp-row">
           <label class="dmp-wp-field"><span>速度</span><input class="dmp-wp-input" type="number" step="1" min="0" max="16" data-field="speed" /></label>
           <label class="dmp-wp-field"><span>悬停</span><input class="dmp-wp-input" type="number" step="1" min="0" max="60" data-field="hoverSeconds" /></label>
@@ -530,15 +584,28 @@ export class MissionPanel {
       row.classList.toggle('is-active', mission.status !== 'idle' && mission.index === index)
       row.classList.toggle('is-selected', selected === index)
       const coord = row.querySelector<HTMLElement>('[data-role="wp-coord"]')
-      if (coord) coord.textContent = `E ${waypoint.x} / S ${waypoint.z}`
+      if (coord) coord.textContent = this.waypointCoordText(waypoint, index)
 
       const numberInput = (field: WaypointNumberField): void => {
         const input = row.querySelector<HTMLInputElement>(`[data-field="${field}"]`)
         if (input) this.writeValue(input, String(waypoint[field]))
       }
-      numberInput('x')
-      numberInput('z')
-      numberInput('altitude')
+      if (this.coordMode === 'geo') {
+        // geo 模式首行是经度/纬度/高度(绝对海拔)的可编辑框,值来自 getWaypointGeo
+        const geo = this.fly.getWaypointGeo(index)
+        if (geo) {
+          const lonInput = row.querySelector<HTMLInputElement>('[data-field="lon"]')
+          if (lonInput) this.writeValue(lonInput, geo.lon.toFixed(8))
+          const latInput = row.querySelector<HTMLInputElement>('[data-field="lat"]')
+          if (latInput) this.writeValue(latInput, geo.lat.toFixed(8))
+          const hInput = row.querySelector<HTMLInputElement>('[data-field="geoHeight"]')
+          if (hInput) this.writeValue(hInput, geo.height.toFixed(1))
+        }
+      } else {
+        numberInput('x')
+        numberInput('z')
+        numberInput('altitude')
+      }
       numberInput('speed')
       numberInput('hoverSeconds')
 
@@ -619,13 +686,17 @@ export class MissionPanel {
     }
 
     if (this.opts.syncIntervalMs !== 0) {
-      this.timer = window.setInterval(() => this.sync(), this.opts.syncIntervalMs ?? DEFAULT_SYNC_MS)
+      this.timer = window.setInterval(
+        () => this.sync(),
+        this.opts.syncIntervalMs ?? DEFAULT_SYNC_MS,
+      )
     }
   }
 
   private handleAction(action: string, target: HTMLElement): void {
     const fly = this.fly
-    const rowIndex = (): number => Number(target.closest<HTMLElement>('.dmp-wp')?.dataset.index ?? -1)
+    const rowIndex = (): number =>
+      Number(target.closest<HTMLElement>('.dmp-wp')?.dataset.index ?? -1)
     switch (action) {
       case 'toggle-collapse':
         this.root.dataset.collapsed = String(this.root.dataset.collapsed !== 'true')
@@ -686,6 +757,9 @@ export class MissionPanel {
       case 'scene-deselect':
         this.selectWaypoint(-1)
         break
+      case 'coord-mode':
+        this.setCoordMode(target.dataset.value === 'geo' ? 'geo' : 'xyz')
+        break
       default:
         return
     }
@@ -709,6 +783,12 @@ export class MissionPanel {
       this.patchWaypoint(index, { action: value })
       return
     }
+    // 经纬度 / 绝对海拔:geo 模式下的可编辑字段,走逆向换算
+    if (name === 'lon' || name === 'lat' || name === 'geoHeight') {
+      const raw = (event.target as HTMLInputElement).value.trim()
+      this.patchWaypointGeo(index, name, raw)
+      return
+    }
     if (!(name in FIELD_RANGES)) return
     const key = name as WaypointNumberField
     const raw = (event.target as HTMLInputElement).value.trim()
@@ -717,7 +797,9 @@ export class MissionPanel {
     const value = Number(raw)
     if (!Number.isFinite(value)) return
     const range = FIELD_RANGES[key]
-    this.patchWaypoint(index, { [key]: clamp(value, range.min, range.max) } as Partial<MissionWaypoint>)
+    this.patchWaypoint(index, {
+      [key]: clamp(value, range.min, range.max),
+    } as Partial<MissionWaypoint>)
   }
 
   // ───────────────────────────── 内部实现:动作 ─────────────────────────────
@@ -732,6 +814,24 @@ export class MissionPanel {
       i === index ? { ...waypoint, ...patch } : waypoint,
     )
     this.fly.setMission(list)
+  }
+
+  /**
+   * geo 模式下编辑经度 / 纬度 / 绝对海拔:取当前经纬高,只替换被改的那一项(其余保持),
+   * 走后端 `setWaypointGeo` 做经纬高 → 本地米坐标的逆向换算。中间态("-"/"1.")会被 `raw === ''`
+   * 与 `!isFinite` 两道门槛拦下,不往下发;越界值就地夹紧,避免面板抖动。
+   */
+  private patchWaypointGeo(index: number, field: string, raw: string): void {
+    if (raw === '') return
+    const current = this.fly.getWaypointGeo(index)
+    if (!current) return
+    const value = Number(raw)
+    if (!Number.isFinite(value)) return
+    const next = { lon: current.lon, lat: current.lat, height: current.height }
+    if (field === 'lon') next.lon = Math.min(180, Math.max(-180, value))
+    else if (field === 'lat') next.lat = Math.min(90, Math.max(-90, value))
+    else if (field === 'geoHeight') next.height = Math.min(9000, Math.max(0, value))
+    this.fly.setWaypointGeo(index, next)
   }
 
   private addWaypoint(): void {
@@ -884,7 +984,12 @@ export class MissionPanel {
 
   /** 启动不了时把原因摆出来,别让按钮灰着却没有解释 */
   private blockReason(
-    snap: { phase: string; phaseLabel: string; positionSource: string; mission: { status: string; total: number } },
+    snap: {
+      phase: string
+      phaseLabel: string
+      positionSource: string
+      mission: { status: string; total: number }
+    },
     editable: boolean,
   ): string {
     if (!editable) return ''
@@ -916,7 +1021,7 @@ export class MissionPanel {
     const waypoint = state.selectedIndex >= 0 ? this.fly.sim.mission[state.selectedIndex] : null
     let text: string
     if (waypoint) {
-      text = `已选中 航点 ${state.selectedIndex + 1} · E ${waypoint.x} / S ${waypoint.z} / ${waypoint.altitude.toFixed(0)} m`
+      text = this.sceneCoordText(state.selectedIndex, waypoint)
     } else {
       text = '未选中航点(在场景里点一下航点光柱)'
     }
@@ -939,6 +1044,41 @@ export class MissionPanel {
     if (!editable) return '任务执行中不可编辑'
     if (!this.fly.isOrbitView) return '需切到观察者视角'
     return '当前不可编辑'
+  }
+
+  /**
+   * 切换坐标显示模式(xyz 本地米 / geo 经纬高)。
+   * geo 模式下航点行首行改为可编辑的「经度 / 纬度 / 高度」,因此切换时要重建行 DOM。
+   */
+  private setCoordMode(mode: 'xyz' | 'geo'): void {
+    if (mode === this.coordMode) return
+    this.coordMode = mode
+    this.root
+      .querySelectorAll<HTMLElement>('[data-action="coord-mode"]')
+      .forEach((button) => button.classList.toggle('is-active', button.dataset.value === mode))
+    // 首行字段集变了,强制重建行(重建会丢失编辑焦点,但切模式是刻意操作,可接受)
+    this.lastWaypointCount = -1
+    this.sync()
+  }
+
+  /** 航点行的坐标徽标文字:xyz = E/S 偏移,geo = 经纬度(8 位小数) */
+  private waypointCoordText(waypoint: MissionWaypoint, index: number): string {
+    if (this.coordMode === 'geo') {
+      const geo = this.fly.getWaypointGeo(index)
+      if (geo) return `经度 ${geo.lon.toFixed(8)} / 纬度 ${geo.lat.toFixed(8)}`
+    }
+    return `E ${waypoint.x} / S ${waypoint.z}`
+  }
+
+  /** 场景编辑状态行的选中航点坐标文字(含海拔);geo 模式用绝对高程 */
+  private sceneCoordText(index: number, waypoint: MissionWaypoint): string {
+    if (this.coordMode === 'geo') {
+      const geo = this.fly.getWaypointGeo(index)
+      if (geo) {
+        return `已选中 航点 ${index + 1} · 经度 ${geo.lon.toFixed(8)} / 纬度 ${geo.lat.toFixed(8)} / ${geo.height.toFixed(1)} m`
+      }
+    }
+    return `已选中 航点 ${index + 1} · E ${waypoint.x} / S ${waypoint.z} / ${waypoint.altitude.toFixed(0)} m`
   }
 
   private stopTimer(): void {
@@ -989,7 +1129,7 @@ const PANEL_CSS = `
   -webkit-tap-highlight-color: transparent;
   overscroll-behavior: contain;
   z-index: 20;
-  width: 262px;
+  width: 300px;
   box-sizing: border-box;
   padding: 10px 12px 12px;
   border: 1px solid var(--dmp-border);
@@ -1078,6 +1218,8 @@ const PANEL_CSS = `
 .dmp-seg button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.11); }
 .dmp-seg button:disabled { opacity: 0.4; cursor: not-allowed; }
 .dmp-seg button.is-active { background: var(--dmp-accent); border-color: var(--dmp-accent); color: var(--dmp-on-accent); font-weight: 600; }
+.dmp-coord-mode { margin-bottom: 7px; }
+.dmp-coord-mode button { font-variant-numeric: tabular-nums; }
 
 .dmp-switch { display: flex; align-items: center; gap: 6px; margin-top: 7px; cursor: pointer; }
 .dmp-switch input { flex: none; accent-color: var(--dmp-accent); }
@@ -1112,6 +1254,9 @@ const PANEL_CSS = `
 .dmp-mini:hover { background: rgba(255, 95, 95, 0.14); }
 .dmp-wp-row { display: grid; grid-template-columns: 1fr 1fr 1.25fr; gap: 5px; margin-bottom: 5px; }
 .dmp-wp-row:last-of-type { margin-bottom: 0; grid-template-columns: repeat(2, 1fr); }
+/* geo 首行:经纬度各占半宽(8 位小数约 10 字符,半宽输入框放得下),高度独占整行 */
+.dmp-wp-row-geo { grid-template-columns: 1fr 1fr; }
+.dmp-wp-row-geo .dmp-wp-geo-h { grid-column: 1 / -1; }
 .dmp-wp-field { display: flex; align-items: center; gap: 4px; min-width: 0; }
 .dmp-wp-field > span { flex: none; color: var(--dmp-muted); font-size: 11px; }
 .dmp-wp-gimbal { grid-column: span 2; }

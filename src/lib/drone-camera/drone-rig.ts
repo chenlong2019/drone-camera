@@ -13,6 +13,9 @@ import * as THREE from 'three'
  *   "铰链 → 桨心"向量与该机臂应有的收纳方向(前臂朝机尾、后臂朝机头)算出来的。
  * - 云台:CTRL_Gimbal_Yaw / Pitch / Roll 三轴。真机云台是增稳平台,
  *   所以这里做反向补偿:机体倾斜多少,云台就往回摆多少(超出机械行程才让画面跟着歪)。
+ * - 起落架腿:LEG_<位置>_<关节>(Hip/Knee/Ankle)三关节链,收腿 = 各关节绕局部 +X
+ *   前乘固定折叠角(哈士奇机体几何实测,见 LEG_FOLD_ANGLES)。没有这些节点的
+ *   机体(真机 GLB)整套腿功能自动停用。
  * - 机体姿态:整体倾斜施加在 CTRL_DJI_Root(模型内部根节点,原点≈机身重心)上。
  */
 
@@ -29,8 +32,11 @@ const degToRad = (deg: number): number => (deg * Math.PI) / 180
  * 符号不是猜的:实测出厂桨叶法线与自转轴的桨距角 φ(前左/后右 ≈ +15°,
  * 前右/后左 ≈ −15°)。要产生向上拉力,φ>0 的桨必须俯视顺时针转(自转角递减),
  * φ<0 的桨必须俯视逆时针转(自转角递增)——据此取反。
+ *
+ * 导出给机体模型使用:程序化机体(见 drone-husky-model)要按同一张表把两组
+ * 对角桨的桨叶反装(顺桨/逆桨),才与这里的自转方向配对。
  */
-const PROP_SPIN_SIGN: Record<ArmPosition, number> = {
+export const PROP_SPIN_SIGN: Record<ArmPosition, number> = {
   FrontLeft: -1,
   RearRight: -1,
   FrontRight: 1,
@@ -42,6 +48,39 @@ const ARM_LABELS: Record<ArmPosition, string> = {
   FrontRight: '前右机臂',
   RearLeft: '后左机臂',
   RearRight: '后右机臂',
+}
+
+/**
+ * 收腿姿态角(度,绕各关节局部 +X;哈士奇机体几何实测,四视角截图确认不穿模):
+ * 髋关节向后上方摆 65°,膝关节反向折回 145°(小腿贴大腿),踝关节再顺 45° 让脚掌
+ * 收平贴腹 —— 四条腿整体收进机身轮廓内,全机最低点从机足抬到机腹。
+ * 符号约定:模型内部坐标 +Z 为机头方向(哈士奇),θ>0 让下垂的腿摆向机尾。
+ */
+const LEG_FOLD_ANGLES = { Hip: 65, Knee: -145, Ankle: 45 } as const
+/** 腿关节旋转轴:各关节局部 +X(机体横轴) */
+const LEG_FOLD_AXIS = new THREE.Vector3(1, 0, 0)
+const LEG_FOLD_QUAT = new THREE.Quaternion()
+
+/**
+ * 机体外形前伸测量口径(米):以云台挂点为轴,只统计该半径内(光轴附近)的机体网格。
+ * 0.3 m 足够覆盖机身与头部,又把四角机臂、电机、桨叶护圈这些"侧向远处"的部件排除掉。
+ */
+const BODY_CLEARANCE_RADIUS_M = 0.3
+/**
+ * 机体外形之前的安全余量(米):相机要沿光轴领先机体外观这么多。
+ * 上仰时最危险的点未必是"世界坐标最前"的那个(光轴是斜的),留 8 cm 覆盖这点误差。
+ */
+const GIMBAL_CAMERA_BODY_MARGIN = 0.08
+
+/** 一条起落架腿:按 LEG_<位置>_<关节> 语义名收集到的三关节(缺哪个补哪个) */
+interface LegJointUnit {
+  node: THREE.Object3D
+  bindQuaternion: THREE.Quaternion
+  foldAngle: number
+}
+interface LegUnit {
+  position: ArmPosition
+  joints: LegJointUnit[]
 }
 
 /**
@@ -247,6 +286,7 @@ export class DroneRig {
   private readonly rigBonesRoot: THREE.Object3D | null
   private readonly props: PropUnit[] = []
   private readonly arms: ArmUnit[] = []
+  private readonly legs: LegUnit[] = []
   private gimbalYaw: THREE.Object3D | null = null
   private gimbalPitch: THREE.Object3D | null = null
   private gimbalRoll: THREE.Object3D | null = null
@@ -257,6 +297,11 @@ export class DroneRig {
    * 取景相机要摆到这段距离之外(换算成米后),外壳才不会挡住视线。
    */
   private gimbalClearanceLocal = 0
+  /**
+   * 挂点前方"机体外形"的前伸量(模型局部单位):哈士奇鼻尖在挂点前 0.84 单位。
+   * 相机前移量必须同时越过它,否则云台上仰时会把机体外观拍进画面(见 measureBodyClearance)。
+   */
+  private gimbalBodyClearanceLocal = 0
   /** 云台偏航节点出厂位置(枢轴 P,父系局部单位) */
   private readonly gimbalBindPosition = new THREE.Vector3()
   /** 相机中心 C − 枢轴 P(父系局部单位);C≈P 时为零向量,补偿自动无效 */
@@ -293,6 +338,8 @@ export class DroneRig {
   private fold = 0
   private spinAngle = 0
   private lastLoad = 0
+  /** 起落架腿收放度(1 = 放下,0 = 完全收起);出厂即放下 */
+  private legDeployState = 1
   /**
    * 桨叶张开度(0 = 叠拢,1 = 自然张开):有自己的缓动节奏——
    * 机臂完全展开后才开始缓慢张开(与真机一致),收纳时快速叠拢。
@@ -305,6 +352,7 @@ export class DroneRig {
   /** 收纳态下沉量(米):机身平贴地面(俯仰 0),脚撑随机臂收起不再接地 */
   private stanceDropFolded = 0
 
+  /** 绑定机体模型根节点,建立机臂/桨叶/云台/起落架的机械控制 */
   constructor(model: THREE.Group) {
     this.model = model
     model.updateMatrixWorld(true)
@@ -313,6 +361,7 @@ export class DroneRig {
     this.collectParts()
     this.buildProps()
     this.buildArms()
+    this.collectLegs()
     this.computeBladeFold()
     this.computeStanceTrim()
     this.bindGimbal()
@@ -352,6 +401,51 @@ export class DroneRig {
   private applyArmFold(arm: ArmUnit, factor: number): void {
     foldQuat.setFromAxisAngle(UP_AXIS, arm.foldAngle * factor)
     arm.node.quaternion.copy(foldQuat).multiply(arm.bindQuaternion)
+  }
+
+  /** 起落架腿当前收放度(1 = 放下,0 = 完全收起);无腿节点的机体恒为 1 */
+  get legDeploy(): number {
+    return this.legs.length === 0 ? 1 : this.legDeployState
+  }
+
+  /**
+   * 设置起落架腿收放度(1 = 放下,0 = 完全收起)。
+   * 与机臂折叠同一条纪律:旋转四元数整体前乘在出厂姿态上 —— 哈士奇腿关节出厂
+   * 四元数是单位阵(等价于直接写 rotation.x),但保持同构写法,未来带烘焙姿态的
+   * 骨骼导出也不跑偏。没有 LEG_* 节点的机体(真机 GLB)是 no-op。
+   */
+  setLegDeploy(deploy: number): void {
+    if (this.legs.length === 0) return
+    const next = clamp(deploy, 0, 1)
+    if (Math.abs(next - this.legDeployState) < 1e-4) return
+    this.legDeployState = next
+    const foldFactor = 1 - next
+    for (const leg of this.legs) {
+      for (const joint of leg.joints) {
+        LEG_FOLD_QUAT.setFromAxisAngle(LEG_FOLD_AXIS, joint.foldAngle * foldFactor)
+        joint.node.quaternion.copy(LEG_FOLD_QUAT).multiply(joint.bindQuaternion)
+      }
+    }
+  }
+
+  /** 收集起落架腿:按 LEG_<位置>_(Hip|Knee|Ankle) 语义名扫描(见 drone-husky-model 适配层) */
+  private collectLegs(): void {
+    const pattern = /^LEG_(FrontLeft|FrontRight|RearLeft|RearRight)_(Hip|Knee|Ankle)$/
+    this.model.traverse((object) => {
+      const match = pattern.exec(object.name)
+      if (!match) return
+      const position = match[1] as ArmPosition
+      let leg = this.legs.find((item) => item.position === position)
+      if (!leg) {
+        leg = { position, joints: [] }
+        this.legs.push(leg)
+      }
+      leg.joints.push({
+        node: object,
+        bindQuaternion: object.quaternion.clone(),
+        foldAngle: degToRad(LEG_FOLD_ANGLES[match[2] as keyof typeof LEG_FOLD_ANGLES]),
+      })
+    })
   }
 
   /**
@@ -429,7 +523,8 @@ export class DroneRig {
       // 目视转速:开机怠速即有明显快转,满载接近视觉走样上限(60fps 下 2 叶桨 ~15 转/秒开始频闪)
       if (clamped <= 0.01) continue
       const revolutionsPerSecond = 3.8 + clamped * 7
-      prop.angle = (prop.angle + revolutionsPerSecond * deltaSeconds * prop.spinSign * Math.PI * 2) %
+      prop.angle =
+        (prop.angle + revolutionsPerSecond * deltaSeconds * prop.spinSign * Math.PI * 2) %
         (Math.PI * 2)
       this.applyPropRotation(prop)
     }
@@ -504,7 +599,8 @@ export class DroneRig {
     )
 
     // 2) 除以挂载父节点的世界姿态(含机头航向、机体俯仰/横滚、停放配平)= 局部姿态
-    const parent = this.gimbalYaw?.parent ?? this.gimbalRoll?.parent ?? this.gimbalPitch?.parent ?? null
+    const parent =
+      this.gimbalYaw?.parent ?? this.gimbalRoll?.parent ?? this.gimbalPitch?.parent ?? null
     if (parent) {
       parent.updateWorldMatrix(true, false)
       parent.getWorldQuaternion(this.gimbalBodyQuat)
@@ -571,10 +667,17 @@ export class DroneRig {
    * 把位置一起解耦:挂点随机体平移、随航向旋转,不随机体俯仰/横滚摆动。
    *
    * @param target 写入世界坐标
-   * @param forwardOffset 沿航向前移量(米):相机要越过载荷外壳前端
+   * @param forwardOffset 沿**云台光轴**的前移量(米):相机要越过载荷外壳与机体外形前端
+   * @param pitchDeg 云台俯仰真值(度,正 = 抬头):决定光轴方向
    * @returns 云台挂点未就绪(模型无云台)时返回 false
+   *
+   * ⚠️ 前移必须沿**光轴**而不能只沿航向(纯水平):云台上仰时光轴朝前上方,机体的
+   * 前上方外形(哈士奇狗鼻尖在挂点上方 0.16 m、前方 0.26 m)在**相机空间**里就落在
+   * 镜头前面 —— 世界 z 上"相机在鼻子之前"是错觉,判据是沿光轴的距离。实测只做水平
+   * 前移时仰到 60° 仍有 0.72% 的画面被鼻壳占据(差异像素全在画面顶部一带)。
+   * 沿光轴前移 = 真机云台俯仰时镜头绕俯仰轴画弧,位置随仰角自然抬起。
    */
-  getGimbalCameraMount(target: THREE.Vector3, forwardOffset: number): boolean {
+  getGimbalCameraMount(target: THREE.Vector3, forwardOffset: number, pitchDeg = 0): boolean {
     if (!this.gimbalMountReady) return false
     const yaw = this.model.rotation.y
     target
@@ -582,8 +685,11 @@ export class DroneRig {
       .multiply(this.model.scale)
       .applyAxisAngle(UP_AXIS, yaw)
       .add(this.model.position)
+    const pitch = degToRad(pitchDeg)
+    // 水平分量按 cos(俯仰) 收缩,同时抬起 offset·sin(俯仰):俯仰为 0 时与纯水平前进等价
     gimbalVec.set(0, 0, -1).applyAxisAngle(UP_AXIS, yaw)
-    target.addScaledVector(gimbalVec, forwardOffset)
+    target.addScaledVector(gimbalVec, forwardOffset * Math.cos(pitch))
+    target.y += forwardOffset * Math.sin(pitch)
     return true
   }
 
@@ -1188,6 +1294,7 @@ export class DroneRig {
       const pod = this.model.getObjectByName('GIMBAL_BlackCameraPod') ?? this.gimbalRoll
       this.gimbalPod = pod
       this.measureGimbalClearance(pod)
+      this.measureBodyClearance()
       if (pod) {
         const box = new THREE.Box3()
         let hasMesh = false
@@ -1230,7 +1337,11 @@ export class DroneRig {
     const corner = new THREE.Vector3()
     let minZ = Number.POSITIVE_INFINITY
     for (let i = 0; i < 8; i += 1) {
-      corner.set(i & 1 ? box.max.x : box.min.x, i & 2 ? box.max.y : box.min.y, i & 4 ? box.max.z : box.min.z)
+      corner.set(
+        i & 1 ? box.max.x : box.min.x,
+        i & 2 ? box.max.y : box.min.y,
+        i & 4 ? box.max.z : box.min.z,
+      )
       corner.applyMatrix4(toLocal)
       if (corner.z < minZ) minZ = corner.z
     }
@@ -1238,8 +1349,59 @@ export class DroneRig {
   }
 
   /**
+   * 量"挂点前方、光轴口径内"的机体外形前伸量(模型局部单位)。
+   *
+   * 与 measureGimbalClearance(载荷壳体自身)是两件事:那条是"别泡进自己的相机壳",
+   * 这条是"别把机体外观拍进画面"。哈士奇的云台枢轴在机头下方,而狗鼻尖伸到枢轴
+   * 前 0.84 单位(0.27 m)—— 相机若只按壳体前移,就还落在鼻子后面:平视看不到
+   * (鼻子在视野上边界之外),但云台上仰超过 ~35° 后画面下缘扫过鼻头(实测
+   * pitch 60° 时鼻壳最近 0.139 m,画面里挂着半个狗鼻子)。
+   *
+   * 做法:遍历所有网格的包围盒 8 角,换算到模型局部系,只统计"在挂点前方(Δz<0)
+   * 且落在光轴口径内(|Δx|、|Δy| ≤ BODY_CLEARANCE_RADIUS_M)"的点,取最大前伸量。
+   * 相机前移量取本值与载荷前端的较大者后,机体外观整体落在相机背后,
+   * 任何俯仰角都不再入镜。
+   */
+  private measureBodyClearance(): void {
+    this.gimbalBodyClearanceLocal = 0
+    if (!this.gimbalMountReady) return
+    const scale = this.model.getWorldScale(new THREE.Vector3())
+    const worldScale = (Math.abs(scale.x) + Math.abs(scale.y) + Math.abs(scale.z)) / 3
+    if (worldScale <= 0) return
+    const radiusLocal = BODY_CLEARANCE_RADIUS_M / worldScale
+    const mount = this.gimbalMountLocal
+    this.model.updateWorldMatrix(true, false)
+    const toLocal = this.model.matrixWorld.clone().invert()
+    const box = new THREE.Box3()
+    const point = new THREE.Vector3()
+    let maxAdvance = 0
+    this.model.traverse((object) => {
+      const mesh = object as THREE.Mesh
+      if (!mesh.isMesh || !mesh.geometry) return
+      box.setFromObject(mesh)
+      if (box.isEmpty()) return
+      for (let i = 0; i < 8; i += 1) {
+        point.set(
+          i & 1 ? box.max.x : box.min.x,
+          i & 2 ? box.max.y : box.min.y,
+          i & 4 ? box.max.z : box.min.z,
+        )
+        point.applyMatrix4(toLocal)
+        const dz = point.z - mount.z
+        if (dz >= 0) continue
+        if (Math.abs(point.x - mount.x) > radiusLocal || Math.abs(point.y - mount.y) > radiusLocal)
+          continue
+        if (-dz > maxAdvance) maxAdvance = -dz
+      }
+    })
+    this.gimbalBodyClearanceLocal = maxAdvance
+  }
+
+  /**
    * 云台载荷沿光轴(-Z)的前端距离(**米**)。
    * 取景相机沿光轴前移量必须大于该值(外加小余量),外壳才不会挡住视线。
+   * 同时取"挂点前方的机体外形前伸量"的较大者:否则机体自己的外观
+   * (哈士奇的狗鼻子)会在云台上仰时入镜,见 measureBodyClearance。
    * 云台未就绪返回 null,调用方退回自己的默认偏移。
    */
   getGimbalCameraClearance(): number | null {
@@ -1248,7 +1410,9 @@ export class DroneRig {
     const scale = this.gimbalRoll.getWorldScale(new THREE.Vector3())
     // 均匀缩放模型;用平均分量抵御非均匀缩放的极端情况
     const worldScale = (Math.abs(scale.x) + Math.abs(scale.y) + Math.abs(scale.z)) / 3
-    return this.gimbalClearanceLocal * worldScale
+    const podNeed = this.gimbalClearanceLocal * worldScale
+    const bodyNeed = this.gimbalBodyClearanceLocal * worldScale + GIMBAL_CAMERA_BODY_MARGIN
+    return Math.max(podNeed, bodyNeed)
   }
 
   /** 机臂折叠枢轴节点(状态灯等机臂附件挂到它下面即可跟随折叠/展开) */

@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { findMissionInsertIndex } from './drone-sim'
 import type { MissionWaypoint } from './drone-sim'
 import type { DroneWorld } from './drone-world'
 
@@ -49,7 +50,9 @@ export interface MissionEditorHost {
   canEdit(): boolean
   /** 航点列表(权威源 = 仿真内核) */
   getWaypoints(): MissionWaypoint[]
+  /** 宿主查询当前选中航点索引(无选中返回 -1) */
   getSelected(): number
+  /** 宿主同步选中航点(编辑器点击/面板列表双向联动) */
   setSelected(index: number): void
   /** 整表提交(新增 / 删除):会重建三维标记 */
   commitWaypoints(waypoints: Array<Partial<MissionWaypoint>>, selected: number): void
@@ -57,9 +60,11 @@ export interface MissionEditorHost {
   moveWaypoint(index: number, patch: Partial<MissionWaypoint>): MissionWaypoint | null
   /** 拖动期间暂停/恢复轨道控制 */
   setOrbitEnabled(enabled: boolean): void
+  /** 取编辑限制(最多航点数/最低高度等,供面板校验) */
   getLimits(): MissionEditLimits
   /** 新航点的默认参数(继承相邻航点的高度与速度) */
   newWaypointTemplate(index: number): Partial<MissionWaypoint>
+  /** 编辑器日志出口(宿主可接到面板或控制台) */
   log(level: 'info' | 'warn', text: string): void
 }
 
@@ -101,6 +106,35 @@ function snap(value: number, step: number): number {
 }
 
 /**
+ * 指针捕获的安全封装。
+ *
+ * ⚠️ Chromium 起 setPointerCapture / releasePointerCapture 返回 **Promise**:
+ * 指针已失效时(合成事件、指针中途松开)是异步 reject —— 调用处的 try/catch 捕不到,
+ * 会冒成未处理 rejection(Playwright 里表现为 pageerror)。同步抛错仍走 try/catch。
+ */
+function capturePointer(canvas: HTMLCanvasElement, pointerId: number): void {
+  try {
+    const result: unknown = canvas.setPointerCapture(pointerId)
+    if (result && typeof (result as Promise<void>).catch === 'function') {
+      ;(result as Promise<void>).catch(() => {})
+    }
+  } catch {
+    /* 指针已释放,同步抛错 */
+  }
+}
+
+function releasePointer(canvas: HTMLCanvasElement, pointerId: number): void {
+  try {
+    const result: unknown = canvas.releasePointerCapture(pointerId)
+    if (result && typeof (result as Promise<void>).catch === 'function') {
+      ;(result as Promise<void>).catch(() => {})
+    }
+  } catch {
+    /* 没捕获过,同步抛错 */
+  }
+}
+
+/**
  * 场景内航点编辑器:接管画布的指针/键盘事件,把拖拽、双击新增、删除等操作翻译成
  * 对宿主航点数据的修改。使用:构造传入宿主 → 每帧 update() → 面板开关 setEnabled()
  * → 卸载时 destroy()。具体操作约定见本文件顶部模块说明。
@@ -120,6 +154,7 @@ export class MissionEditor {
   private readonly planeNormal = new THREE.Vector3()
   private readonly hitPoint = new THREE.Vector3()
 
+  /** 构造航线编辑器:维护航点列表与 Home 点,产出可执行任务 */
   constructor(host: MissionEditorHost) {
     this.host = host
     const canvas = host.canvas
@@ -132,10 +167,12 @@ export class MissionEditor {
     window.addEventListener('keydown', this.onKeyDown)
   }
 
+  /** 编辑模式是否开启(开启时点场景可加/拖航点) */
   get isEnabled(): boolean {
     return this.enabled
   }
 
+  /** 开关编辑模式 */
   setEnabled(enabled: boolean): void {
     if (this.enabled === enabled) return
     this.enabled = enabled
@@ -155,6 +192,7 @@ export class MissionEditor {
     if (this.host.getSelected() >= 0) this.host.setSelected(-1)
   }
 
+  /** 取航线只读快照(航点/Home/可视性,供面板与鹰眼图渲染) */
   getState(): MissionEditState {
     return {
       enabled: this.enabled,
@@ -166,6 +204,7 @@ export class MissionEditor {
     }
   }
 
+  /** 解散编辑器与场景里的航线辅助物 */
   destroy(): void {
     const canvas = this.host.canvas
     canvas.removeEventListener('pointerdown', this.onPointerDown)
@@ -196,11 +235,7 @@ export class MissionEditor {
     this.drag = this.createDrag(event, index, waypoint)
     this.host.setOrbitEnabled(false)
     this.host.canvas.style.cursor = event.shiftKey ? 'ns-resize' : 'grabbing'
-    try {
-      this.host.canvas.setPointerCapture(event.pointerId)
-    } catch {
-      /* 指针已释放 */
-    }
+    capturePointer(this.host.canvas, event.pointerId)
   }
 
   /** 建立拖动状态:按 Shift 决定拖水平面还是竖直面,并记下"按下那一像素"的参考点 */
@@ -263,11 +298,7 @@ export class MissionEditor {
   }
 
   private readonly onPointerUp = (event: PointerEvent): void => {
-    try {
-      this.host.canvas.releasePointerCapture(event.pointerId)
-    } catch {
-      /* 没捕获过 */
-    }
+    releasePointer(this.host.canvas, event.pointerId)
     const emptyClick = this.emptyClick
     this.emptyClick = null
     const drag = this.drag
@@ -319,7 +350,7 @@ export class MissionEditor {
     z = snap(z, SNAP_STEP)
 
     const list = this.host.getWaypoints()
-    const at = this.findInsertIndex(list, x, z, limits.homeX, limits.homeZ)
+    const at = findMissionInsertIndex(list, x, z, limits.homeX, limits.homeZ)
     const template = this.host.newWaypointTemplate(at)
     const next: Array<Partial<MissionWaypoint>> = list.map((waypoint) => ({ ...waypoint }))
     next.splice(at, 0, { ...template, x, z })
@@ -419,43 +450,6 @@ export class MissionEditor {
     if (this.hoverIndex === index) return
     this.hoverIndex = index
     this.host.world.setMissionHover(index)
-  }
-
-  /**
-   * 新航点插到哪个位置:取"绕路最少"的那一格。
-   *
-   * 判据是插入后航线增加的长度(prev→新点→next 减去原来的 prev→next),
-   * 而不是"离哪一段最近" —— 后者在等距处会出现平手,可能把一个明明贴着前面航段的点
-   * 插到后面去,航线就绕了。最小绕路法天然没有这个歧义。
-   */
-  private findInsertIndex(
-    list: MissionWaypoint[],
-    x: number,
-    z: number,
-    homeX: number,
-    homeZ: number,
-  ): number {
-    const distance = (fromX: number, fromZ: number, toX: number, toZ: number): number =>
-      Math.hypot(toX - fromX, toZ - fromZ)
-    let bestIndex = 0
-    let bestDetour = Number.POSITIVE_INFINITY
-    for (let index = 0; index <= list.length; index += 1) {
-      const previous = index === 0 ? null : list[index - 1]
-      const next = list[index] ?? null
-      const fromX = previous ? previous.x : homeX
-      const fromZ = previous ? previous.z : homeZ
-      const detour = next
-        ? distance(fromX, fromZ, x, z) +
-          distance(x, z, next.x, next.z) -
-          distance(fromX, fromZ, next.x, next.z)
-        : distance(fromX, fromZ, x, z) // 接到队尾:只看从上一个航点飞过去的距离
-      // 减去 1e-6 容差:浮点上打成平手时保留更靠前的插入位,避免结果抖动
-      if (detour < bestDetour - 1e-6) {
-        bestDetour = detour
-        bestIndex = index
-      }
-    }
-    return bestIndex
   }
 
   private cancelDrag(): void {

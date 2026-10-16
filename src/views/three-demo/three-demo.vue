@@ -4,7 +4,7 @@
   </div>
 </template>
 <script setup lang="ts">
-import UseLibDemo from '@/components/use-lib-demo/use-lib-demo.vue'
+import UseLibDemo from '@/components/use-three-demo/use-three-demo.vue'
 </script>
 <style lang="scss" scoped>
 .div-main {

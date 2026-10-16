@@ -280,6 +280,7 @@ export class DroneRadar {
 
   private snapshot: RadarSnapshot = EMPTY_SNAPSHOT
 
+  /** 绑定雷达扫描可视化(光束挂机体下方,随障碍物真值偏转) */
   constructor(scene: THREE.Scene) {
     for (let index = 0; index < this.sensors.length; index += 1) {
       const sensor = this.sensors[index]

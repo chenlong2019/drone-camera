@@ -5,7 +5,8 @@
  * - 左右两根虚拟摇杆**脱离面板**,作为悬浮 HUD 挂在画面左下 / 右下角(控制罗盘左右各一个);
  * - 拍照 / 录像是「技能」按钮,悬浮在右轮盘上方(蓝圈 = 拍照,橙圈 = 录像),
  *   角标显示拍照张数 / 录制秒数(对应游戏里技能的buff计数);
- * - 面板本体只留飞行控制(上电/起飞/降落/返航/机臂/模式)+ 视角切换 + 云台,停靠按 position 选项。
+ * - 面板本体只留飞行控制(上电/起飞/降落/返航/机臂/模式)+ 速度倍率(0~1000,数值即倍数)+
+ *   视角切换 + 云台,停靠按 position 选项。
  *
  * 设计边界:
  * - 只用原生 DOM / CSS,不引入任何 UI 框架 —— 库整体保持与框架无关(Vue / React / 裸页面通用);
@@ -25,10 +26,26 @@
  * - 悬浮层与面板是**两个兄弟节点**(都挂在 container 上):面板有 backdrop-filter,会把 fixed 后代的定位
  *   基准改成面板自身,所以摇杆不能塞进面板里;悬浮层 pointer-events:none、只留轮盘可点,不挡场景交互。
  */
+import type { DronePanelHost } from './drone-control'
 import { CAMERA_MODE_LIST } from './drone-fly'
-import type { CameraMode, DroneFly, PhotoShot } from './drone-fly'
-import { FLIGHT_MODE_LIST, PHASE_LABELS } from './drone-sim'
+import type { CameraMode, PhotoShot } from './drone-fly'
+import {
+  DEFAULT_SPEED_SCALE,
+  FLIGHT_MODE_LIST,
+  PHASE_LABELS,
+  SPEED_SCALE_MAX,
+  SPEED_SCALE_MIN,
+} from './drone-sim'
 import type { FlightMode } from './drone-sim'
+import { PANORAMA_MODE_LIST, PANORAMA_PRESETS, PanoramaCapture } from './drone-panorama'
+import type { PanoramaMode, PanoramaProgress } from './drone-panorama'
+import type { CaptureService } from './drone-capture'
+
+/** 拍摄模式:单张 / 广角 / 180° 全景 / 球形 360° */
+type ShootMode = 'single' | PanoramaMode
+
+/** 全景每张之间的默认间隔(毫秒):贴近真机节奏,也给渲染后端留出稳定时间 */
+const DEFAULT_PANORAMA_INTERVAL_MS = 120
 
 /** 面板停靠位置(相对挂载容器) */
 export type DronePanelPosition = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
@@ -49,6 +66,17 @@ export interface DroneControlPanelOptions {
   visible?: boolean
   /** 拍照完成回调;未提供且 autoDownload 为 true 时自动下载 PNG */
   onPhoto?: (shot: PhotoShot) => void
+  /**
+   * 采集服务(可选)。提供后面板出现「拍摄模式」区,可切换广角 / 180° / 360°:
+   * 全景按预设网格逐张取景拍摄,每张都带全景分组信息登记进这个服务的当前会话。
+   *
+   * 与采集面板共用同一个实例时,全景照片会直接出现在那边的影像集里(见 demo 的接法)。
+   */
+  captureService?: CaptureService
+  /** 是否启用全景拍摄(默认 true);没有 `captureService` 时不显示该区 */
+  panorama?: boolean
+  /** 全景每张之间的间隔(毫秒),默认 120 */
+  panoramaShotIntervalMs?: number
   /** 录像完成回调;未提供且 autoDownload 为 true 时自动下载 webm */
   onRecording?: (blob: Blob, seconds: number) => void
   /** 无自定义回调时是否自动下载产物,默认 true */
@@ -96,6 +124,20 @@ export interface DroneControlPanelOptions {
 
 const STYLE_ID = 'drone-control-panel-styles'
 const DEFAULT_PITCH_PRESETS = [-90, -30, -10, 0]
+/**
+ * 速度倍率滑杆的步长。
+ * 行程 0 ~ 1000(数值即倍数),步长取 0.5 而不是 1 —— 倍率越小差异越明显,
+ * 0.5×(半速)是很常用的一档,整数步长到不了它;0.5 步长下整数与 .5 都能取到。
+ */
+const SPEED_SCALE_STEP = 0.5
+/** 速度倍率快捷档位:半速 / 原速 / 2 倍 / 5 倍 / 10 倍(超过 10 倍靠滑杆或直接输入) */
+const SPEED_SCALE_PRESETS: Array<{ value: number; label: string }> = [
+  { value: 0.5, label: '0.5×' },
+  { value: 1, label: '1×' },
+  { value: 2, label: '2×' },
+  { value: 5, label: '5×' },
+  { value: 10, label: '10×' },
+]
 /** 云台俯仰可用范围,与 DRONE_SPEC 保持一致 */
 const PITCH_MIN = -90
 const PITCH_MAX = 60
@@ -155,6 +197,12 @@ function isTypingTarget(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable
 }
 
+/** 速度倍率写进输入框的文本:整数原样,小数去掉多余的 0(0.5 → "0.5",2.0 → "2") */
+function formatScale(value: number): string {
+  if (!Number.isFinite(value)) return String(DEFAULT_SPEED_SCALE)
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)))
+}
+
 /** 摇杆所在的一侧,决定行程写进哪两个通道 */
 type StickSide = 'left' | 'right'
 
@@ -199,8 +247,15 @@ const PANEL_CSS = `
 }
 .dcp {
   z-index: 20;
-  width: 230px;
+  /* 264px ≈ 任务面板(dmp 262px)同宽:230px 时预设行(0.5x/1x/2x/5x/10x 五连)、
+     四联分段控件挤到文字贴边;加宽只动行内空间,高度与块间距不变 */
+  width: 264px;
+  /* 高度封顶:面板加了拍摄模式区后内容超过 HUD 安全线(右下技能钮顶边距底 215px、
+     768 高的窗口里摇杆顶边距底 169px),必须让面板在矮视口里内部滚动,而不是压住摇杆 */
+  max-height: min(66vh, 640px);
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
   padding: 10px 12px 12px;
   border: 1px solid var(--dcp-border);
   border-radius: var(--dcp-radius);
@@ -227,6 +282,19 @@ const PANEL_CSS = `
 .dcp-icon:hover { border-color: var(--dcp-accent); color: var(--dcp-accent); }
 .dcp-label { display: flex; justify-content: space-between; align-items: baseline; color: var(--dcp-muted); margin-bottom: 6px; }
 .dcp-label em { font-style: normal; color: var(--dcp-text); font-variant-numeric: tabular-nums; }
+/* 速度倍率:读数位放一个可直接输入的数字框(0~1000 的行程光靠拖滑杆到不了精确值) */
+.dcp-speed-val { display: inline-flex; align-items: center; gap: 2px; color: var(--dcp-text); }
+.dcp-speed-val i { font-style: normal; }
+.dcp-num {
+  width: 56px; padding: 1px 4px; border-radius: 5px; text-align: right;
+  border: 1px solid var(--dcp-border); background: rgba(255, 255, 255, 0.06);
+  color: var(--dcp-text); font: inherit; font-variant-numeric: tabular-nums;
+  /* 微调按钮在窄面板里太挤,且方向键已能微调,隐掉它 */
+  -moz-appearance: textfield; appearance: textfield;
+}
+.dcp-num:focus { outline: none; border-color: var(--dcp-accent); }
+.dcp-num::-webkit-outer-spin-button,
+.dcp-num::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 .dcp-segmented { display: flex; gap: 4px; }
 .dcp-seg {
   flex: 1; min-width: 0; padding: 6px 0; border-radius: 7px; cursor: pointer;
@@ -269,7 +337,15 @@ const PANEL_CSS = `
 }
 
 /* ── 主体:竖屏纵向流式;横屏(见媒体查询)改成两列网格 ── */
-.dcp-body { display: flex; flex-direction: column; }
+.dcp-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
 /* display:contents 让各个控制块直接成为 .dcp-body 的 flex item */
 .dcp-mid { display: contents; }
 .dcp-blk { display: block; }
@@ -558,7 +634,7 @@ export class DroneControlPanel {
   /** 悬浮摇杆/技能层(面板的兄弟节点,铺满容器;宿主可追加类名做二次定制) */
   readonly hudLayer: HTMLDivElement
 
-  private readonly fly: DroneFly
+  private readonly fly: DronePanelHost
   private readonly opts: DroneControlPanelOptions
   private readonly presets: number[]
   private readonly container: HTMLElement
@@ -592,6 +668,8 @@ export class DroneControlPanel {
     armDeployButton: HTMLButtonElement
     armFoldButton: HTMLButtonElement
     flightModeLabel: HTMLElement
+    speedSlider: HTMLInputElement
+    speedInput: HTMLInputElement
     preflight: HTMLElement
     pitchSlider: HTMLInputElement
     pitchValue: HTMLElement
@@ -599,18 +677,30 @@ export class DroneControlPanel {
     recordButton: HTMLButtonElement
     recTime: HTMLElement
     note: HTMLElement
+    /** 「拍摄模式」区的读数位(未启用全景时为 null) */
+    shootLabel: HTMLElement | null
   }
 
   private timer: number | null = null
   private pitchDragging = false
+  /** 正在拖速度倍率滑杆:期间不回写,免得和用户的手打架 */
+  private speedDragging = false
   private photoBusy = false
   private visible: boolean
   private collapsed = false
   private destroyed = false
   /** 停止录像前抓的时长,用于回调与提示(stopRecording 后 sim.recordSeconds 会归零) */
   private lastRecordSeconds = 0
+  /** 全景扫描器(未接采集服务时为 null) */
+  private panorama: PanoramaCapture | null = null
+  private panoramaUnsub: (() => void) | null = null
+  /** 当前拍摄模式:单张 / 180° / 360° */
+  private shootMode: ShootMode = 'single'
+  /** 最近一次全景进度(面板只做展示) */
+  private panoProgress: PanoramaProgress | null = null
 
-  constructor(fly: DroneFly, options: DroneControlPanelOptions = {}) {
+  /** 构造控制面板并插入容器(可传 options 停靠位置/手感/键盘开关) */
+  constructor(fly: DronePanelHost, options: DroneControlPanelOptions = {}) {
     if (typeof document === 'undefined') {
       throw new Error('[drone-camera] DroneControlPanel 需要浏览器环境(document),Node 侧请勿实例化')
     }
@@ -628,6 +718,14 @@ export class DroneControlPanel {
     this.visible = options.visible ?? true
 
     if (options.injectStyles !== false) ensureStyles()
+
+    // 全景扫描器要在**模板生成之前**就绪 —— 模板按 this.panorama 的有无决定渲不渲染
+    // 「拍摄模式」区。它只依赖采集服务(取景方位由服务在每张内部施加并复位),不碰渲染后端。
+    if (options.captureService && options.panorama !== false) {
+      this.panorama = new PanoramaCapture(options.captureService, {
+        shotIntervalMs: options.panoramaShotIntervalMs ?? DEFAULT_PANORAMA_INTERVAL_MS,
+      })
+    }
 
     // 面板用 absolute 定位到容器;容器若没有定位上下文则补一个 relative,否则会跑到页面左上角
     const host = options.container ?? null
@@ -662,6 +760,8 @@ export class DroneControlPanel {
       armDeployButton: this.query<HTMLButtonElement>('[data-role="arm-deploy"]'),
       armFoldButton: this.query<HTMLButtonElement>('[data-role="arm-fold"]'),
       flightModeLabel: this.query('[data-role="flight-mode-label"]'),
+      speedSlider: this.query<HTMLInputElement>('[data-role="speed-scale"]'),
+      speedInput: this.query<HTMLInputElement>('[data-role="speed-scale-input"]'),
       preflight: this.query('[data-role="preflight"]'),
       pitchSlider: this.query<HTMLInputElement>('[data-role="pitch"]'),
       pitchValue: this.query('[data-role="pitch-value"]'),
@@ -669,8 +769,19 @@ export class DroneControlPanel {
       recordButton: this.queryIn<HTMLButtonElement>(this.hudLayer, '[data-role="toggle-record"]'),
       recTime: this.queryIn(this.hudLayer, '[data-role="rec-time"]'),
       note: this.query('[data-role="note"]'),
+      // 全景区是条件渲染的(没接采集服务就没有),所以用可空查询
+      shootLabel: this.root.querySelector<HTMLElement>('[data-role="shoot-label"]'),
     }
     this.sticks = this.collectSticks()
+
+    // 订阅进度(全景实例已在上面按需创建;回调只碰 DOM 与进度字段,构造期不会触发)
+    if (this.panorama) {
+      this.panoramaUnsub = this.panorama.subscribe((progress) => {
+        this.panoProgress = progress
+        this.syncShootMode()
+        this.syncHudBadge()
+      })
+    }
 
     this.bind()
     this.sync()
@@ -723,6 +834,10 @@ export class DroneControlPanel {
     this.releaseSticks()
     this.abort.abort()
     this.stopTimer()
+    // 全景扫描:先停扫描(它还在逐张 await),再退订 —— 否则回调会打到已移除的 DOM 上
+    this.panorama?.cancel()
+    this.panoramaUnsub?.()
+    this.panoramaUnsub = null
     this.root.remove()
     this.hudLayer.remove()
   }
@@ -758,19 +873,26 @@ export class DroneControlPanel {
 
     // 起飞前检查未过时说明卡在哪一项(如 GNSS 搜星),否则用户只会觉得"点了没反应"
     const blocked = fly.preflightChecks.filter((item) => item.blocking && !item.ok)
-    this.refs.preflight.textContent = blocked.length ? `待通过:${blocked.map((item) => item.label).join('、')}` : ''
+    this.refs.preflight.textContent = blocked.length
+      ? `待通过:${blocked.map((item) => item.label).join('、')}`
+      : ''
     this.refs.preflight.title = blocked.map((item) => `${item.label}:${item.detail}`).join('\n')
 
     // 飞行模式:真值取 fly.flightMode
     const flightMode = fly.flightMode
-    this.refs.flightModeLabel.textContent = FLIGHT_MODE_LIST.find((item) => item.key === flightMode)?.label ?? flightMode
+    this.refs.flightModeLabel.textContent =
+      FLIGHT_MODE_LIST.find((item) => item.key === flightMode)?.label ?? flightMode
     this.root.querySelectorAll<HTMLElement>('[data-action="set-flight-mode"]').forEach((button) => {
       button.classList.toggle('is-active', button.dataset.mode === flightMode)
     })
 
+    // 速度倍率:真值取 sim.speedScale(可能与界面控件不一致 —— 宿主/脚本改过就以下一轮同步为准)
+    this.renderSpeedScale(fly.sim.speedScale)
+
     // 视角:真值取 fly.cameraMode
     const mode = fly.cameraMode
-    this.refs.modeLabel.textContent = CAMERA_MODE_LIST.find((item) => item.key === mode)?.label ?? mode
+    this.refs.modeLabel.textContent =
+      CAMERA_MODE_LIST.find((item) => item.key === mode)?.label ?? mode
     this.root.querySelectorAll<HTMLElement>('[data-action="set-mode"]').forEach((button) => {
       button.classList.toggle('is-active', button.dataset.mode === mode)
     })
@@ -785,11 +907,60 @@ export class DroneControlPanel {
     // 摇杆读数:正被手指按住的那根以面板为准(回写会打架),其余跟随引擎真值
     this.syncStickReadout()
 
-    // 技能角标(游戏里的 buff 计数位):拍照张数 / 录制秒数,空串即隐藏
-    this.refs.photoCount.textContent = fly.sim.photoCount > 0 ? String(fly.sim.photoCount) : ''
+    this.syncShootMode()
+    this.syncHudBadge()
+  }
+
+  /** 技能角标(游戏里的 buff 计数位):全景扫描中优先显示扫描进度,否则显示拍照张数 */
+  private syncHudBadge(): void {
+    const fly = this.fly
+    const progress = this.panoProgress
+    this.refs.photoCount.textContent =
+      progress?.state === 'running'
+        ? `${progress.index}/${progress.total}`
+        : fly.sim.photoCount > 0
+          ? String(fly.sim.photoCount)
+          : ''
     const recording = fly.isRecording
     this.refs.recordButton.classList.toggle('is-recording', recording)
     this.refs.recTime.textContent = recording ? `${fly.sim.recordSeconds.toFixed(0)}s` : ''
+  }
+
+  /** 拍摄模式区:模式高亮 + 读数(空闲显示张数,扫描中/完成显示进度) */
+  private syncShootMode(): void {
+    if (!this.panorama) return
+    const running = this.panorama.running
+    this.root
+      .querySelectorAll<HTMLButtonElement>('[data-action="set-shoot-mode"]')
+      .forEach((button) => {
+        const isActive = button.dataset.mode === this.shootMode
+        button.classList.toggle('is-active', isActive)
+        // 扫描中锁模式:半途换模式会让"这一组"变成两种参数混拍
+        button.toggleAttribute('disabled', running && !isActive)
+      })
+    const label = this.refs.shootLabel
+    if (!label) return
+    const progress = this.panoProgress
+    const preset =
+      this.shootMode === 'single'
+        ? null
+        : PanoramaCapture.preset(
+            this.shootMode,
+            this.opts.captureService?.getCaptureIntrinsics()?.verticalFovDeg,
+          )
+    if (progress && progress.mode === this.shootMode && progress.state !== 'idle') {
+      const prefix =
+        progress.state === 'running'
+          ? '扫描中'
+          : progress.state === 'done'
+            ? '完成'
+            : progress.state === 'failed'
+              ? '未完成'
+              : '已停止'
+      label.textContent = `${prefix} ${progress.index}/${progress.total}`
+      return
+    }
+    label.textContent = preset ? `${preset.total} 张` : '单张'
   }
 
   // ───────────────────────────── 内部实现 ─────────────────────────────
@@ -820,6 +991,24 @@ export class DroneControlPanel {
       (item) =>
         `<button type="button" class="dcp-seg" data-action="set-flight-mode" data-mode="${item.key}">${item.label}</button>`,
     ).join('')
+    const speedPresets = SPEED_SCALE_PRESETS.map(
+      (item) =>
+        `<button type="button" class="dcp-preset" data-action="preset-speed" data-scale="${item.value}">${item.label}</button>`,
+    ).join('')
+    // 全景区只在接入采集服务时出现 —— 照片要有地方归档、能被导出,这个功能才成立
+    const shootSection = this.panorama
+      ? `<section class="dcp-blk" data-blk="shoot">
+            <div class="dcp-label">拍摄模式<em data-role="shoot-label">单张</em></div>
+            <div class="dcp-segmented">
+              <button type="button" class="dcp-seg is-active" data-action="set-shoot-mode" data-mode="single">单张</button>
+              ${PANORAMA_MODE_LIST.map(
+                (mode) =>
+                  `<button type="button" class="dcp-seg" data-action="set-shoot-mode" data-mode="${mode}">${PANORAMA_PRESETS[mode].label}</button>`,
+              ).join('')}
+            </div>
+            <p class="dcp-hint">悬停中拍摄:广角 3×3、180° 分层扫描、球形 360° 另补天顶/天底。</p>
+          </section>`
+      : ''
 
     return `
       <div class="dcp-head">
@@ -846,6 +1035,22 @@ export class DroneControlPanel {
             <div class="dcp-segmented">${flightModes}</div>
           </section>
 
+          <section class="dcp-blk" data-blk="speed">
+            <div class="dcp-label">
+              速度倍率
+              <span class="dcp-speed-val">
+                <input class="dcp-num" type="number" data-role="speed-scale-input"
+                  min="${SPEED_SCALE_MIN}" max="${SPEED_SCALE_MAX}" step="${SPEED_SCALE_STEP}"
+                  value="${formatScale(DEFAULT_SPEED_SCALE)}" title="0 ~ ${SPEED_SCALE_MAX},数值即倍数(1 = 真机原速)" />
+                <i>×</i>
+              </span>
+            </div>
+            <input class="dcp-range" type="range" data-role="speed-scale"
+              min="${SPEED_SCALE_MIN}" max="${SPEED_SCALE_MAX}" step="${SPEED_SCALE_STEP}"
+              value="${formatScale(DEFAULT_SPEED_SCALE)}" title="左右拖动;0 = 机体不动,1 = 真机原速" />
+            <div class="dcp-presets">${speedPresets}</div>
+          </section>
+
           <section class="dcp-blk" data-blk="camera">
             <div class="dcp-label">相机视角<em data-role="mode-label">--</em></div>
             <div class="dcp-segmented">${modes}</div>
@@ -857,6 +1062,8 @@ export class DroneControlPanel {
             <input class="dcp-range" type="range" data-role="pitch" min="${PITCH_MIN}" max="${PITCH_MAX}" step="1" value="-10" />
             <div class="dcp-presets">${presets}</div>
           </section>
+
+          ${shootSection}
         </div>
         <p class="dcp-note" data-role="note"></p>
         <p class="dcp-keys">${this.keyboardEnabled ? '键盘  W/S 升降 · A/D 转向 · ↑/↓ 前后 · ←/→ 横滚 · Ctrl+K 拍照 · Ctrl+L 录像' : ''}</p>
@@ -900,7 +1107,11 @@ export class DroneControlPanel {
   }
 
   /** 单根虚拟摇杆:底盘 + 十字刻度 + 四向提示 + 可按压的杆帽 + 实时读数 */
-  private stickTemplate(side: StickSide, caption: string, marks: ReadonlyArray<readonly [string, string]>): string {
+  private stickTemplate(
+    side: StickSide,
+    caption: string,
+    marks: ReadonlyArray<readonly [string, string]>,
+  ): string {
     const arrows = marks
       .map(([dir, label]) => `<span class="dcp-stick-arrow" data-dir="${dir}">${label}</span>`)
       .join('')
@@ -973,6 +1184,32 @@ export class DroneControlPanel {
     slider.addEventListener('pointerdown', () => (this.pitchDragging = true), { signal })
     // 指针可能在面板外抬起,所以监听挂在 window 上(随 signal 一起解绑)
     window.addEventListener('pointerup', () => (this.pitchDragging = false), { signal })
+
+    // 速度倍率:滑杆拖动即时生效(0 ~ 1000,数值即倍数);数字框可直接输入精确值
+    const speedSlider = this.refs.speedSlider
+    speedSlider.addEventListener('input', () => this.applySpeedScale(speedSlider.value), { signal })
+    speedSlider.addEventListener('pointerdown', () => (this.speedDragging = true), { signal })
+    window.addEventListener('pointerup', () => (this.speedDragging = false), { signal })
+
+    const speedInput = this.refs.speedInput
+    speedInput.addEventListener(
+      'input',
+      () => {
+        // 用户正在删改(空串)或输入非法字符时保持原值不动,别把半截输入当成倍率下发
+        if (speedInput.value.trim() === '') return
+        this.applySpeedScale(speedInput.value)
+      },
+      { signal },
+    )
+    // 提交 / 失焦:把输入框归一(清掉 "3%"、"9999" 这类越界或非数字的残留)
+    speedInput.addEventListener(
+      'change',
+      () => {
+        speedInput.value = formatScale(this.fly.sim.speedScale)
+        this.sync()
+      },
+      { signal },
+    )
 
     // 虚拟摇杆:pointerdown 落在底盘上就锁定这个指针,之后拖到哪儿都继续跟手;
     // move/up 挂在 window 上,是因为指针移出摇杆(甚至移出画面)时事件不再冒泡到悬浮层
@@ -1084,7 +1321,12 @@ export class DroneControlPanel {
    * 半径按底盘边长缓存 —— 键盘每 ~16ms 刷一次,不能每次都去读布局(会引发布局抖动);
    * 换屏 / 旋转导致杆径变化时,边长对不上会自动重测。
    */
-  private paintStick(handle: StickHandle, vertical: number, lateral: number, active: boolean): void {
+  private paintStick(
+    handle: StickHandle,
+    vertical: number,
+    lateral: number,
+    active: boolean,
+  ): void {
     const span = handle.base.offsetWidth
     if (span !== handle.radiusSpan) {
       handle.radiusSpan = span
@@ -1193,7 +1435,8 @@ export class DroneControlPanel {
       const target = goal[channel]
       if (current === target) continue
       const step = delta / (target === 0 ? this.keyboardFall : this.keyboardRise)
-      const next = Math.abs(target - current) <= step ? target : current + Math.sign(target - current) * step
+      const next =
+        Math.abs(target - current) <= step ? target : current + Math.sign(target - current) * step
       this.keyboardStick[channel] = next
       changed = true
     }
@@ -1239,8 +1482,7 @@ export class DroneControlPanel {
       if (handle.pointerId !== null) continue
       const vertical = handle.side === 'left' ? stick.throttle : stick.pitch
       // 读数是"杆位"语义:飞控里的偏航是缩放后的值,显示前还原回杆位
-      const lateral =
-        handle.side === 'left' ? stick.yaw / (this.yawRateScale || 1) : stick.roll
+      const lateral = handle.side === 'left' ? stick.yaw / (this.yawRateScale || 1) : stick.roll
       handle.read.textContent = formatStickText(vertical, lateral)
     }
   }
@@ -1254,6 +1496,37 @@ export class DroneControlPanel {
 
   private renderPitch(value: number): void {
     this.refs.pitchValue.textContent = `${Math.round(value)}°`
+  }
+
+  /**
+   * 下发速度倍率并同步两个控件。
+   *
+   * 真值以飞控为准(`sim.setSpeedScale` 内部夹到 0 ~ 1000),回写用夹紧后的值。
+   * ⚠️ 数字框**聚焦期间不回写**:归一化会抹掉用户刚敲的小数点("2." → "2"),
+   * 之后再敲 "5" 就成了 25;归一交给 change(失焦 / 回车)。
+   */
+  private applySpeedScale(raw: string | number): void {
+    const value = typeof raw === 'number' ? raw : Number(raw)
+    if (!Number.isFinite(value)) return
+    this.fly.sim.setSpeedScale(value)
+    const applied = this.fly.sim.speedScale
+    if (!this.speedDragging) this.refs.speedSlider.value = String(applied)
+    if (document.activeElement !== this.refs.speedInput) {
+      this.refs.speedInput.value = formatScale(applied)
+    }
+    this.setNote(
+      applied === 0
+        ? '速度倍率 0×:机体不会移动(含自动起飞 / 降落)'
+        : `速度倍率 ${formatScale(applied)}×`,
+    )
+  }
+
+  /** 把倍率刷到滑杆与数字框上(轮询同步用;拖动滑杆 / 正在输入时跳过,免得和用户的手打架) */
+  private renderSpeedScale(value: number): void {
+    if (!this.speedDragging) this.refs.speedSlider.value = String(value)
+    if (document.activeElement !== this.refs.speedInput) {
+      this.refs.speedInput.value = formatScale(value)
+    }
   }
 
   private setNote(text: string): void {
@@ -1319,9 +1592,24 @@ export class DroneControlPanel {
         this.sync()
         break
       }
+      case 'preset-speed': {
+        const scale = Number(el.dataset.scale)
+        if (!Number.isFinite(scale)) return
+        this.applySpeedScale(scale)
+        this.sync()
+        break
+      }
       case 'photo':
         void this.takePhoto()
         break
+      case 'set-shoot-mode': {
+        if (this.panorama?.running) break
+        const mode = el.dataset.mode as ShootMode | undefined
+        if (!mode) break
+        this.shootMode = mode
+        this.syncShootMode()
+        break
+      }
       case 'toggle-record':
         void this.toggleRecording()
         break
@@ -1335,6 +1623,11 @@ export class DroneControlPanel {
 
   private async takePhoto(): Promise<void> {
     if (this.photoBusy || this.destroyed) return
+    // 全景模式:拍照钮变成"开始 / 停止整组扫描"的开关(与大疆的拍摄模式语义一致)
+    if (this.shootMode !== 'single') {
+      await this.runPanorama()
+      return
+    }
     this.photoBusy = true
     this.setNote('拍照中…')
     try {
@@ -1344,12 +1637,57 @@ export class DroneControlPanel {
         return
       }
       if (this.opts.onPhoto) this.opts.onPhoto(shot)
-      else if (this.opts.autoDownload !== false) triggerDownload(shot.dataUrl, `drone-photo-${stamp()}.png`)
+      else if (this.opts.autoDownload !== false)
+        triggerDownload(shot.dataUrl, `drone-photo-${stamp()}.png`)
       this.setNote(`已拍摄 ${shot.width}×${shot.height}`)
     } catch (error) {
       this.setNote(`拍照异常:${(error as Error).message}`)
     } finally {
       this.photoBusy = false
+    }
+  }
+
+  /**
+   * 全景拍摄:点一次开始整组网格扫描,再点一次请求停止(见 `PanoramaCapture`)。
+   * 面板只负责挑会话与播报 —— 网格、逐张取景、方位复位都在库里,这里不碰渲染后端。
+   */
+  private async runPanorama(): Promise<void> {
+    const pano = this.panorama
+    const service = this.opts.captureService
+    if (!pano || !service) return
+    if (pano.running) {
+      pano.cancel()
+      this.setNote('正在停止全景拍摄…')
+      return
+    }
+    const mode = this.shootMode as PanoramaMode
+    const preset = PanoramaCapture.preset(mode, service.getCaptureIntrinsics()?.verticalFovDeg)
+    // 全景靠**机体原地自转**补水平视野(云台 Pan 只有 ±30°),所以必须悬停中拍:
+    // 在地面或航线中自转不成立,真机也是这个前提。提前挡住,免得出 21 张同一方位的废片。
+    if (this.fly.phase !== 'flying') {
+      this.setNote('全景需要定点悬停中拍摄(请先起飞并停止航线)')
+      return
+    }
+    // 没有会话就现建一个:全景是"拍一组照片",总得有地方归档
+    const session =
+      service.activeSession ??
+      service.createSession({ source: 'virtual-camera', name: `全景-${stamp()}` })
+    this.photoBusy = true
+    this.setNote(`${preset.label} 扫描中 0/${preset.total}…`)
+    try {
+      const result = await pano.start(session.id, mode)
+      if (!result) this.setNote('全景启动失败(可能已有扫描在进行)')
+      else if (result.error) this.setNote(`全景未完成:${result.error}`)
+      else if (result.cancelled) this.setNote(`全景已停止(${result.captured}/${result.total})`)
+      else
+        this.setNote(
+          `${preset.label} 完成 ${result.captured}/${result.total}${result.stitched ? ' · 已拼接' : ''}`,
+        )
+    } catch (error) {
+      this.setNote(`全景异常:${(error as Error).message}`)
+    } finally {
+      this.photoBusy = false
+      this.sync()
     }
   }
 
@@ -1364,7 +1702,8 @@ export class DroneControlPanel {
         this.setNote('录像为空,未保存')
       } else {
         if (this.opts.onRecording) this.opts.onRecording(blob, this.lastRecordSeconds)
-        else if (this.opts.autoDownload !== false) triggerDownload(URL.createObjectURL(blob), `drone-video-${stamp()}.webm`)
+        else if (this.opts.autoDownload !== false)
+          triggerDownload(URL.createObjectURL(blob), `drone-video-${stamp()}.webm`)
         this.setNote(`已保存 ${this.lastRecordSeconds.toFixed(1)}s`)
       }
       this.sync()
