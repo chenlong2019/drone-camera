@@ -11,6 +11,7 @@ import type { DroneModelSpec } from '@/lib'
 
 /** Optional Cesium ion token supplied at build time through VITE_CESIUM_ION_TOKEN. */
 const ION_TOKEN = import.meta.env.VITE_CESIUM_ION_TOKEN?.trim() ?? ''
+const HAS_ION_TOKEN = Boolean(ION_TOKEN && ION_TOKEN !== '******')
 
 declare global {
   interface Window {
@@ -38,17 +39,28 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
   async function init(): Promise<void> {
     await loadCesiumScript('/Cesium/Cesium.js')
     const Cesium = window.Cesium!
-    if (ION_TOKEN && ION_TOKEN !== '******') {
+    if (HAS_ION_TOKEN) {
       Cesium.Ion.defaultAccessToken = ION_TOKEN
     }
 
     const fallbackImagery = new Cesium.OpenStreetMapImageryProvider({
       url: 'https://a.tile.openstreetmap.org/',
     })
+    let terrainProvider = new Cesium.EllipsoidTerrainProvider()
+    let hasIonTerrain = false
+    if (HAS_ION_TOKEN && typeof Cesium.createWorldTerrainAsync === 'function') {
+      try {
+        terrainProvider = await Cesium.createWorldTerrainAsync()
+        hasIonTerrain = true
+      } catch (error) {
+        console.warn('[drone-camera] Cesium World Terrain unavailable; using ellipsoid terrain.', error)
+      }
+    }
     const v = new Cesium.Viewer(container, {
       animation: false,
       timeline: false,
-      baseLayerPicker: true,
+      // Ion terrain/imagery entries are only exposed when a token is configured.
+      baseLayerPicker: hasIonTerrain,
       geocoder: false,
       homeButton: true,
       navigationHelpButton: false,
@@ -57,7 +69,7 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
       infoBox: false,
       selectionIndicator: false,
       imageryProvider: fallbackImagery,
-      terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+      terrainProvider,
       contextOptions: { webgl: { preserveDrawingBuffer: true } },
     })
     v.scene.globe.show = true

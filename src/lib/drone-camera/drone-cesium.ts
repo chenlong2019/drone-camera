@@ -350,6 +350,8 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
   private rafId: number | null = null
   private lastTime = 0
   private disposed = false
+  /** Stop terrain sampling after an authorization failure so a bad Ion token cannot spam requests. */
+  private terrainSamplingDisabled = false
   /** 相机是否被本适配器锁在无人机上(退出 follow/fpv 时要把 transform 还回去) */
   private cameraLocked = false
   /**
@@ -405,14 +407,17 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
    */
   async start(): Promise<void> {
     const C = this.C
-    try {
-      const carto = C.Cartographic.fromDegrees(this.origin.lon, this.origin.lat)
-      const [sampled] = await C.sampleTerrainMostDetailed(this.viewer.terrainProvider, [carto])
-      if (sampled && Number.isFinite(sampled.height)) {
-        this.origin.height = sampled.height
+    const provider = this.viewer.terrainProvider
+    if (this.canSampleTerrain(provider)) {
+      try {
+        const carto = C.Cartographic.fromDegrees(this.origin.lon, this.origin.lat)
+        const [sampled] = await C.sampleTerrainMostDetailed(provider, [carto])
+        if (sampled && Number.isFinite(sampled.height)) {
+          this.origin.height = sampled.height
+        }
+      } catch (error) {
+        this.handleTerrainError(error)
       }
-    } catch {
-      // 离线 / ion 不可用:沿用传入的高度,不阻断飞行
     }
     this.rebuildEnuFrame()
     void this.loadModel()
@@ -1105,21 +1110,50 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
 
   /** 在当前相对坐标处采样地形并确保无人机不钻进地形里 */
   private async ensureAltitudeAboveTerrain(): Promise<void> {
-    if (this.disposed || !this.viewer.terrainProvider) return
+    const provider = this.viewer.terrainProvider
+    if (!this.canSampleTerrain(provider)) return
     const C = this.C
     const local = C.Cartesian3.fromElements(this.sim.position.x, -this.sim.position.z, 0)
     const world = C.Matrix4.multiplyByPoint(this.enuToFixed, local, new C.Cartesian3())
     const carto = C.Cartographic.fromCartesian(world)
     try {
-      const [sampled] = await C.sampleTerrainMostDetailed(this.viewer.terrainProvider, [carto])
+      const [sampled] = await C.sampleTerrainMostDetailed(provider, [carto])
       if (!sampled || !Number.isFinite(sampled.height)) return
       const minAltitude =
         sampled.height - this.origin.height - this.groundClearance - this.modelSpec.lift + 0.25
       if (this.sim.position.y < minAltitude) {
         this.sim.position.y = minAltitude
       }
+    } catch (error) {
+      this.handleTerrainError(error)
+    }
+  }
+
+  private canSampleTerrain(provider: CesiumNS): boolean {
+    return Boolean(
+      !this.disposed &&
+        !this.terrainSamplingDisabled &&
+        provider &&
+        provider.availability &&
+        typeof provider.requestTileGeometry === 'function',
+    )
+  }
+
+  private handleTerrainError(error: unknown): void {
+    const source = error as {
+      statusCode?: unknown
+      response?: { status?: unknown }
+      message?: unknown
+    }
+    const status = source?.statusCode ?? source?.response?.status
+    const message = String(source?.message ?? error ?? '')
+    if (status !== 401 && status !== 403 && !/\b(?:401|403)\b/.test(message)) return
+
+    this.terrainSamplingDisabled = true
+    try {
+      this.viewer.terrainProvider = new this.C.EllipsoidTerrainProvider()
     } catch {
-      // 地形不可用时忽略,保留当前高度不阻断飞行
+      // Keep the current provider if this Cesium build does not expose EllipsoidTerrainProvider.
     }
   }
 
