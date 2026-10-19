@@ -51,6 +51,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run-colmap-re
 -ColmapExe "C:\Program Files\COLMAP\bin\colmap.exe"
 ```
 
+如果不想处理 PowerShell 文件关联，也可以直接双击 `scripts\run-colmap-reconstruction.bat`。它默认使用当前 Windows 用户的 `Downloads` 目录；也可以在 `cmd.exe` 中指定目录：
+
+```bat
+scripts\run-colmap-reconstruction.bat "C:\Users\11746\Downloads"
+```
+
+有 NVIDIA GPU 时追加 `-UseGpu`：
+
+```bat
+scripts\run-colmap-reconstruction.bat "C:\Users\11746\Downloads" -UseGpu
+```
+
 ## 2. 运行 COLMAP
 
 安装 COLMAP，并确认命令行可用：
