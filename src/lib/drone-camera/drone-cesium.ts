@@ -491,13 +491,14 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
    * 无扩展可摘(或净化关闭)时返回原 URL —— 零额外开销、零对象 URL 泄漏;
    * 取文件失败时也回退原 URL,让 Cesium 自己报出真正的网络/解析错误。
    */
-  private async resolveModelUrl(url: string): Promise<string> {
+  private async resolveModelUrl(url: string, token: number): Promise<string> {
     this.releaseSanitizedUrl()
     if (this.stripExtensions.length === 0 || typeof fetch !== 'function') return url
     try {
       const response = await fetch(url)
       if (!response.ok) return url
       const patched = stripRequiredExtensions(await response.arrayBuffer(), this.stripExtensions)
+      if (this.disposed || token !== this.loadToken) return url
       if (!patched) return url
       this.sanitizedBlobUrl = URL.createObjectURL(
         new Blob([patched], { type: 'model/gltf-binary' }),
@@ -551,7 +552,7 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
     const spec = this.modelSpec
     const token = ++this.loadToken
     // 净化后的 Blob URL(或原 URL)—— 摘掉 Cesium 不支持的 required 扩展,见文件头
-    const url = await this.resolveModelUrl(spec.url)
+    const url = await this.resolveModelUrl(spec.url, token)
     if (this.disposed || token !== this.loadToken) return
     let model: CesiumNS
     try {
@@ -566,7 +567,10 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
       return
     }
     // 等待期间页面已销毁或又切了机体 → 丢弃这次的结果
-    if (this.disposed || token !== this.loadToken) return
+    if (this.disposed || token !== this.loadToken) {
+      if (!model.isDestroyed()) model.destroy()
+      return
+    }
     if (this.model) this.viewer.scene.primitives.remove(this.model)
     this.model = model
     this.viewer.scene.primitives.add(model)
@@ -807,42 +811,29 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
     if (!width || !height) return null
 
     const { destination, heading, pitch, roll } = this.gimbalCameraView()
-    // 与 camera.setView({orientation:{heading,pitch,roll}}) 内部用的是同一个换算,
-    // 所以这个四元数就是相机此刻的真实姿态(而不是另算一套近似)。
-    let rotation = C.Transforms.headingPitchRollQuaternion(
-      destination,
-      new C.HeadingPitchRoll(heading, pitch, roll),
-    )
-    let position = destination
-    // During an actual capture use the rendered camera basis. This records the
-    // camera-local-to-world rotation of the exact frame copied to the PNG,
-    // including Cesium's current reference transform, instead of rebuilding a
-    // quaternion from HPR after the frame has been restored.
-    if (this.captureFrameActive) {
-      const rendered = this.viewer.camera
-      const right = rendered.rightWC
-      const up = rendered.upWC
-      const forward = rendered.directionWC
-      if (right && up && forward && rendered.positionWC) {
-        rotation = cameraQuaternionFromBasis(
-          {
-            right: [right.x, right.y, right.z],
-            up: [up.x, up.y, up.z],
-            forward: [forward.x, forward.y, forward.z],
-          },
-          'cesium',
-        )
-        position = C.Cartesian3.clone(rendered.positionWC)
-      }
+    // HPR model quaternions use different axes from a view camera. Derive
+    // both live snapshots and idle previews from the actual camera basis.
+    const rendered = this.captureFrameActive ? this.viewer.camera : new C.Camera(this.viewer.scene)
+    if (!this.captureFrameActive) {
+      rendered.setView({ destination, orientation: { heading, pitch, roll } })
     }
+    const right = rendered.rightWC
+    const up = rendered.upWC
+    const forward = rendered.directionWC
+    const rotation = cameraQuaternionFromBasis({
+      right: [right.x, right.y, right.z],
+      up: [up.x, up.y, up.z],
+      forward: [forward.x, forward.y, forward.z],
+    }, 'cesium')
+    const position = rendered.positionWC
     const carto = C.Cartographic.fromCartesian(position)
-    // PerspectiveFrustum.fovy 是**垂直**视场角(弧度)
-    const fovY: number =
-      typeof this.viewer.camera.frustum?.fovy === 'number'
-        ? this.viewer.camera.frustum.fovy
-        : (60 * Math.PI) / 180
-    const fy = height / 2 / Math.tan(fovY / 2)
-    const fx = fy
+    // Read the rendered projection, including off-centre principal points.
+    // Orthographic views cannot be represented by this PINHOLE contract.
+    const projection = this.viewer.camera.frustum?.projectionMatrix
+    if (!projection || Math.abs(projection[11] + 1) > 1e-8) return null
+    const fx = projection[0] * width / 2
+    const fy = projection[5] * height / 2
+    const fovY = 2 * Math.atan(height / (2 * fy))
     const fovX = 2 * Math.atan(width / (2 * fx))
     const sim = this.sim
     const degrees = (radians: number): number => (radians * 180) / Math.PI
@@ -850,7 +841,7 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
     return {
       pose: {
         position: [position.x, position.y, position.z],
-        rotation: [rotation.x, rotation.y, rotation.z, rotation.w],
+        rotation,
         coordinateFrame: 'ecef',
       },
       intrinsics: {
@@ -858,8 +849,8 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
         height,
         fx,
         fy,
-        cx: width / 2,
-        cy: height / 2,
+        cx: width * (1 - projection[8]) / 2,
+        cy: height * (1 + projection[9]) / 2,
         horizontalFovDeg: degrees(fovX),
         verticalFovDeg: degrees(fovY),
         calibrationSource: 'known',
@@ -968,16 +959,16 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
     const restore = fpv
       ? null
       : photo
-        ? (this.photoCameraRestore?.camera ?? null)
+        ? (this.photoCameraRestore?.camera ?? this.snapshotCamera())
         : this.snapshotCamera()
     if (photo && !this.photoCameraRestore) this.photoCameraRestore = { camera: restore }
     if (!fpv) this.applyGimbalCameraPose()
     this.setCaptureFrameVisible(false)
     if (photo) {
       this.captureFrameActive = true
-      photo.captureCamera = this.getCaptureCamera()
     }
     this.viewer.render()
+    if (photo) photo.captureCamera = this.getCaptureCamera()
     if (recording) this.pushRecordFrame()
     // 首帧 setView 后 Cesium 可能仍显示上一视角的地形/影像瓦片;保持取景位姿,
     // 直到地球瓦片就绪并连续渲染两帧,再拷贝画面。
@@ -1569,8 +1560,9 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
 
   getLimits(): MissionEditLimits {
     return {
-      maxAltitude: this.sim.config.maxAltitude,
-      maxDistance: this.sim.config.maxDistance,
+      // 用 ceiling 而不是 config 原值:unlimitedFlight 打开时是 Infinity,编辑器的夹紧自动失效
+      maxAltitude: this.sim.altitudeCeiling,
+      maxDistance: this.sim.distanceCeiling,
       homeX: this.sim.homePosition.x,
       homeZ: this.sim.homePosition.z,
     }

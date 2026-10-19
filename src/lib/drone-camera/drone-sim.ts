@@ -206,6 +206,19 @@ export interface SimConfig {
   maxAltitude: number
   /** 限距(米) */
   maxDistance: number
+  /**
+   * 取消高度与距离限制(演示 / 取景用),默认 `false`。
+   *
+   * `true` 时 `maxAltitude` / `maxDistance` 不再参与任何夹紧:
+   * 摇杆升降与水平位移不被截断、航点不被夹回限高面/限距圆、航线校验不再拦超限航点,
+   * 面板通过 `getLimits()` 拿到的高度/距离上限变成 `Infinity`。
+   *
+   * 改回 `false` 时若机体已在限制之外,下一帧就会被夹回边界(高度落到 `maxAltitude`,
+   * 位置沿返航点方向缩到 `maxDistance` 圆上),所以这不是"一次性开关"。
+   *
+   * ⚠️ 只放开**限高 / 限距**这两条人为上限:电池、姿态、避障、GNSS 等物理与失效约束照旧生效。
+   */
+  unlimitedFlight: boolean
   /** 返航高度(米) */
   rthAltitude: number
   /** 风速 m/s */
@@ -238,10 +251,11 @@ export interface SimConfig {
   gnssAcquireRate: number
 }
 
-/** 出厂默认参数:限高 120 m(合规上限)、限距 500 m、无风、实时 */
+/** 出厂默认参数:限高 120 m(合规上限)、限距 500 m、限高限距生效、无风、实时 */
 export const DEFAULT_CONFIG: SimConfig = {
   maxAltitude: 120,
   maxDistance: 500,
+  unlimitedFlight: false,
   rthAltitude: 20,
   windSpeed: 0,
   windDirection: 0,
@@ -353,15 +367,31 @@ export const DEFAULT_MISSION: MissionWaypoint[] = [
   { x: -28, z: 0, altitude: 35, speed: 6, hoverSeconds: 0, gimbalPitch: null, action: 'none' },
 ]
 
-/** 单个航点字段归一化(手输/外部传入都可能越界) */
-export function normalizeMissionWaypoint(source: Partial<MissionWaypoint>): MissionWaypoint {
+/**
+ * 航点高度的**硬上限**(米)。
+ *
+ * 与 `SimConfig.maxAltitude`(可配置的限高)不是一回事:它是字段归一化的护栏,
+ * 挡住外部灌进来的离谱值(比如 1e9),默认 500 m 就已高于合规限高。
+ * `unlimitedFlight` 打开时内部会传 `Infinity` 把它一起放开。
+ */
+export const MISSION_ALTITUDE_HARD_LIMIT = 500
+
+/**
+ * 单个航点字段归一化(手输/外部传入都可能越界)。
+ *
+ * @param maxAltitude 高度上限,默认 {@link MISSION_ALTITUDE_HARD_LIMIT};取消限高时传 `Infinity`
+ */
+export function normalizeMissionWaypoint(
+  source: Partial<MissionWaypoint>,
+  maxAltitude: number = MISSION_ALTITUDE_HARD_LIMIT,
+): MissionWaypoint {
   const number = (value: unknown, fallback: number): number =>
     typeof value === 'number' && Number.isFinite(value) ? value : fallback
   const pitch = source.gimbalPitch
   return {
     x: number(source.x, 0),
     z: number(source.z, 0),
-    altitude: clamp(number(source.altitude, 30), 1, 500),
+    altitude: clamp(number(source.altitude, 30), 1, maxAltitude),
     speed: clamp(number(source.speed, 0), 0, 16),
     hoverSeconds: clamp(number(source.hoverSeconds, 0), 0, 60),
     gimbalPitch:
@@ -907,6 +937,40 @@ export class DroneSim {
   get motorsOn(): boolean {
     // 电机负载 >2% 视为桨叶已转动(怠速也在转)
     return this.motorLoad > 0.02
+  }
+
+  /**
+   * 当前生效的限高(米)。`unlimitedFlight` 打开时为 `Infinity`,即不夹。
+   *
+   * 面板、航线编辑器、场景拖拽都通过 `getLimits()` 拿这个值来夹航点,
+   * 所以只要一个开关,UI 侧的输入上限也会同步失效 —— 不会出现"内核放开了但拖不出去"。
+   */
+  get altitudeCeiling(): number {
+    return this.config.unlimitedFlight ? Number.POSITIVE_INFINITY : this.config.maxAltitude
+  }
+
+  /** 当前生效的限距(米)。`unlimitedFlight` 打开时为 `Infinity`,即不夹。 */
+  get distanceCeiling(): number {
+    return this.config.unlimitedFlight ? Number.POSITIVE_INFINITY : this.config.maxDistance
+  }
+
+  /**
+   * 增量修改仿真配置(限高限距开关 / 风 / 电量阈值等),立即生效,只覆盖传入的字段。
+   *
+   * 只改配置本身:不清位置、不清电量、不动正在执行的任务。若把 `unlimitedFlight`
+   * 从 `true` 改回 `false`,下一帧物理步进就会把机体夹回限高面 / 限距圆。
+   */
+  setConfig(patch: Partial<SimConfig>): void {
+    const unlimitedBefore = this.config.unlimitedFlight
+    this.config = { ...this.config, ...patch }
+    if (patch.unlimitedFlight !== undefined && patch.unlimitedFlight !== unlimitedBefore) {
+      this.pushEvent(
+        'info',
+        patch.unlimitedFlight
+          ? '已取消高度 / 距离限制(演示模式)'
+          : `已恢复限高 ${this.config.maxAltitude} m、限距 ${this.config.maxDistance} m`,
+      )
+    }
   }
 
   /** 当前生效的飞行速度倍率(夹到 0 ~ 1000;非法值退回 1) */
@@ -1504,10 +1568,11 @@ export class DroneSim {
     this.position.z += this.velocity.z * delta
     this.position.y += this.velocity.y * delta
 
-    // 限高 / 限距
+    // 限高 / 限距(unlimitedFlight 打开时两个上限都是 Infinity,两段都不进入)
     this.altitudeLimitReached = false
-    if (this.position.y >= this.config.maxAltitude) {
-      this.position.y = this.config.maxAltitude
+    const ceiling = this.altitudeCeiling
+    if (Number.isFinite(ceiling) && this.position.y >= ceiling) {
+      this.position.y = ceiling
       if (this.velocity.y > 0) this.velocity.y = 0
       this.altitudeLimitReached = true
       this.warnOnce('altitude', '已达最大飞行高度限制')
@@ -1518,9 +1583,10 @@ export class DroneSim {
     }
     const distance = this.distanceToHome
     this.distanceLimitReached = false
-    if (distance > this.config.maxDistance) {
+    const radius = this.distanceCeiling
+    if (Number.isFinite(radius) && distance > radius) {
       // 超距时沿返航点方向等比缩回,精确落到限距圆上
-      const ratio = this.config.maxDistance / distance
+      const ratio = radius / distance
       this.position.x = this.home.x + (this.position.x - this.home.x) * ratio
       this.position.z = this.home.z + (this.position.z - this.home.z) * ratio
       this.velocity.x = 0
@@ -1760,13 +1826,26 @@ export class DroneSim {
 
   // ————————————————————————————— 航线任务 —————————————————————————————
 
+  /**
+   * 航线内部的航点归一化:在字段护栏之外,把高度上限跟 `unlimitedFlight` 对齐。
+   *
+   * 默认仍是 {@link MISSION_ALTITUDE_HARD_LIMIT}(500 m);取消限高时传 `Infinity`,
+   * 否则会出现"限高放开了、航点却被 500 m 静默夹住"的矛盾。
+   */
+  private normalizeWaypoint(source: Partial<MissionWaypoint>): MissionWaypoint {
+    return normalizeMissionWaypoint(
+      source,
+      this.config.unlimitedFlight ? Number.POSITIVE_INFINITY : MISSION_ALTITUDE_HARD_LIMIT,
+    )
+  }
+
   /** 设置航点列表(执行中禁止修改,与真机"上传后不可改"一致) */
   setMission(waypoints: Array<Partial<MissionWaypoint>>): boolean {
     if (this.missionStatus !== 'idle' || this.missionPending) {
       this.pushEvent('warn', '航线执行中无法修改航点列表,请先停止任务')
       return false
     }
-    this.mission = waypoints.map((waypoint) => normalizeMissionWaypoint(waypoint))
+    this.mission = waypoints.map((waypoint) => this.normalizeWaypoint(waypoint))
     this.missionIndex = -1
     this.missionStage = 'idle'
     return true
@@ -1784,7 +1863,7 @@ export class DroneSim {
     if (this.missionStatus !== 'idle' || this.missionPending) return null
     const current = this.mission[index]
     if (!current) return null
-    const next = normalizeMissionWaypoint({ ...current, ...patch })
+    const next = this.normalizeWaypoint({ ...current, ...patch })
     this.constrainMissionWaypoint(next)
     this.mission[index] = next
     return next
@@ -1800,7 +1879,7 @@ export class DroneSim {
       return -1
     }
     const at = clamp(Math.round(index), 0, this.mission.length)
-    const next = normalizeMissionWaypoint(waypoint)
+    const next = this.normalizeWaypoint(waypoint)
     this.constrainMissionWaypoint(next)
     const list = this.mission.slice()
     list.splice(at, 0, next)
@@ -1821,14 +1900,20 @@ export class DroneSim {
     return true
   }
 
-  /** 把一个航点夹进可执行范围:高度不超限高,水平距离不超限距(超出则沿返航点方向缩回) */
+  /**
+   * 把一个航点夹进可执行范围:高度不超限高,水平距离不超限距(超出则沿返航点方向缩回)。
+   *
+   * `unlimitedFlight` 打开时两步都跳过(上限为 `Infinity`),只有"不低于 1 m"仍保留。
+   */
   private constrainMissionWaypoint(waypoint: MissionWaypoint): void {
-    waypoint.altitude = clamp(waypoint.altitude, 1, this.config.maxAltitude)
+    const ceiling = this.altitudeCeiling
+    waypoint.altitude = Number.isFinite(ceiling) ? clamp(waypoint.altitude, 1, ceiling) : Math.max(1, waypoint.altitude)
     const offsetX = waypoint.x - this.home.x
     const offsetZ = waypoint.z - this.home.z
     const distance = Math.hypot(offsetX, offsetZ)
-    if (distance <= this.config.maxDistance) return
-    const scale = this.config.maxDistance / distance
+    const radius = this.distanceCeiling
+    if (!Number.isFinite(radius) || distance <= radius) return
+    const scale = radius / distance
     waypoint.x = this.home.x + offsetX * scale
     waypoint.z = this.home.z + offsetZ * scale
   }
@@ -1971,17 +2056,20 @@ export class DroneSim {
     this.pushEvent('warn', `航线任务已中止(${reason})`)
   }
 
-  /** 航点合法性校验(限高限距):真机在上传航线时就会拦下这类航点 */
+  /** 航点合法性校验(限高限距):真机在上传航线时就会拦下这类航点;`unlimitedFlight` 打开时整段跳过 */
   private validateMission(): string | null {
+    const ceiling = this.altitudeCeiling
+    const radius = this.distanceCeiling
+    if (!Number.isFinite(ceiling) && !Number.isFinite(radius)) return null
     for (let index = 0; index < this.mission.length; index += 1) {
       const waypoint = this.mission[index]
       if (!waypoint) continue
-      if (waypoint.altitude > this.config.maxAltitude) {
-        return `航点 ${index + 1} 高度 ${waypoint.altitude} m 超过限高 ${this.config.maxAltitude} m`
+      if (Number.isFinite(ceiling) && waypoint.altitude > ceiling) {
+        return `航点 ${index + 1} 高度 ${waypoint.altitude} m 超过限高 ${ceiling} m`
       }
       const distance = Math.hypot(waypoint.x - this.home.x, waypoint.z - this.home.z)
-      if (distance > this.config.maxDistance) {
-        return `航点 ${index + 1} 距返航点 ${distance.toFixed(0)} m,超过限距 ${this.config.maxDistance} m`
+      if (Number.isFinite(radius) && distance > radius) {
+        return `航点 ${index + 1} 距返航点 ${distance.toFixed(0)} m,超过限距 ${radius} m`
       }
     }
     return null

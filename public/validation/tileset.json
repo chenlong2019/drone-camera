@@ -1,0 +1,56 @@
+{
+  "asset": {
+    "version": "1.1",
+    "tilesetVersion": "synthetic-validation-1"
+  },
+  "geometricError": 32,
+  "root": {
+    "boundingVolume": {
+      "box": [
+        0,
+        0,
+        8,
+        9,
+        0,
+        0,
+        0,
+        6,
+        0,
+        0,
+        0,
+        8
+      ]
+    },
+    "geometricError": 0,
+    "refine": "ADD",
+    "transform": [
+      -0.8957815923193475,
+      -0.4444944756257542,
+      0,
+      0,
+      0.2851565255681053,
+      -0.5746707339254272,
+      0.7670979751606293,
+      0,
+      -0.3409708122226017,
+      0.6871522456543357,
+      0.6415299653987042,
+      0,
+      -2177760.6443315796,
+      4388801.221710213,
+      4069984.7359510916,
+      1
+    ],
+    "content": {
+      "uri": "building.gltf"
+    }
+  },
+  "extras": {
+    "notice": "Synthetic loading fixture only; not a photogrammetry reconstruction.",
+    "origin": {
+      "longitude": 116.391,
+      "latitude": 39.906,
+      "altitude": 0
+    }
+  }
+}

@@ -19,6 +19,7 @@
         </a>
         <a class="docs-nav-item docs-nav-api" @click="goApiDocs">API 参考</a>
         <a class="docs-nav-item docs-nav-api" @click="goClassMap">类与方法</a>
+        <RouterLink class="docs-nav-item docs-nav-api" to="/photogrammetry-validation">摄影测量验证</RouterLink>
         <button type="button" class="docs-back" @click="onBack">
           <span class="docs-back-arrow">←</span>
           返回演示

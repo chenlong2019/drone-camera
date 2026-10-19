@@ -24,6 +24,7 @@
         <div class="api-nav-actions">
           <button type="button" class="api-nav-btn" @click="goDocs">← 使用文档</button>
           <button type="button" class="api-nav-btn" @click="goClassMap">类与方法</button>
+          <RouterLink class="api-nav-btn" to="/photogrammetry-validation">摄影测量验证</RouterLink>
           <button type="button" class="api-nav-btn" @click="goDemo">进入演示 →</button>
         </div>
       </div>

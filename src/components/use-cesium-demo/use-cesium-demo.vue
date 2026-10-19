@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import { useCesiumDemo, type CesiumDemoApi } from './use-cesium-demo'
 
 const container = ref<HTMLElement | null>(null)
@@ -56,6 +57,7 @@ function switchModel(): void {
         <small class="mono">{{ phaseText }}</small>
       </div>
       <button class="model-switch" type="button" @click="switchModel">切换机体</button>
+      <RouterLink class="validation-link" to="/photogrammetry-validation">验证采集</RouterLink>
     </div>
   </main>
 </template>
@@ -129,5 +131,12 @@ function switchModel(): void {
 
 .model-switch:hover {
   background: rgb(43 98 140 / 88%);
+}
+
+.validation-link {
+  color: #a6e8db;
+  font-size: 12px;
+  white-space: nowrap;
+  text-decoration: none;
 }
 </style>

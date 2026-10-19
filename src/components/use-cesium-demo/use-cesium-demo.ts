@@ -104,6 +104,10 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
       lon: ORIGIN.lon,
       lat: ORIGIN.lat,
     })
+    // 与 three 页同款演示开关:`?unlimited=1` 取消限高 / 限距
+    if (new URLSearchParams(window.location.search).get('unlimited') === '1') {
+      adapter.sim.setConfig({ unlimitedFlight: true })
+    }
     void adapter.start()
     adapter.powerOn()
     adapter.setArmsFolded(false)

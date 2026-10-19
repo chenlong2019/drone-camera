@@ -95,6 +95,8 @@ export class ReconstructionPreview<TTileset, TOriginal = unknown> {
   private compareMode: ReconstructionPreviewCompareMode
   private visible: boolean
   private destroyed = false
+  private loadVersion = 0
+  private readonly originalVisibility = new Map<Showable, { hadShow: boolean; show: boolean | undefined }>()
 
   constructor(options: ReconstructionPreviewOptions<TTileset, TOriginal>) {
     if (!options || !options.viewer) throw new TypeError('A viewer is required')
@@ -108,6 +110,7 @@ export class ReconstructionPreview<TTileset, TOriginal = unknown> {
     this.original = options.original
     this.compareMode = options.compareMode ?? 'both'
     this.visible = options.visible ?? true
+    this.rememberOriginalVisibility()
     this.applyVisibility()
   }
 
@@ -146,23 +149,30 @@ export class ReconstructionPreview<TTileset, TOriginal = unknown> {
   async load(url: string): Promise<TTileset> {
     this.assertAlive()
     if (typeof url !== 'string' || !url.trim()) throw new TypeError('A non-empty tileset URL is required')
+    const version = ++this.loadVersion
 
     // Resolve before removing the current result, so a transient network
     // failure does not make an already visible preview disappear.
     const loaded = await this.loader(url)
     if (loaded === null || loaded === undefined) throw new Error('Tileset loader returned no tileset')
+    if (this.destroyed || version !== this.loadVersion) {
+      if (loaded !== this.currentTileset) this.destroyPrimitive(loaded)
+      throw new Error(this.destroyed ? 'ReconstructionPreview has been destroyed' : 'Tileset load was superseded')
+    }
 
     const previous = this.currentTileset
-    if (previous !== null) this.unmount(previous)
-    this.currentTileset = loaded
-    this.currentUrl = url
-    try {
-      this.primitives.add(loaded)
-    } catch (error) {
-      this.currentTileset = null
-      this.currentUrl = null
-      this.destroyPrimitive(loaded)
-      throw error
+    if (loaded !== previous) {
+      try {
+        this.primitives.add(loaded)
+      } catch (error) {
+        this.destroyPrimitive(loaded)
+        throw error
+      }
+      this.currentTileset = loaded
+      this.currentUrl = url
+      if (previous !== null) this.unmount(previous)
+    } else {
+      this.currentUrl = url
     }
     this.applyVisibility()
     return loaded
@@ -170,6 +180,7 @@ export class ReconstructionPreview<TTileset, TOriginal = unknown> {
 
   /** Change which scene layers are shown. */
   setCompareMode(mode: ReconstructionPreviewCompareMode): void {
+    this.assertAlive()
     if (mode !== 'original' && mode !== 'reconstructed' && mode !== 'both') {
       throw new RangeError(`Unknown reconstruction compare mode: ${String(mode)}`)
     }
@@ -179,13 +190,17 @@ export class ReconstructionPreview<TTileset, TOriginal = unknown> {
 
   /** Toggle the complete preview while preserving the compare mode. */
   setVisible(visible: boolean): void {
+    this.assertAlive()
     this.visible = Boolean(visible)
     this.applyVisibility()
   }
 
   /** Replace the caller-owned original primitive used by comparison mode. */
   setOriginal(original: TOriginal | readonly TOriginal[] | undefined): void {
+    this.assertAlive()
+    this.restoreOriginalVisibility()
     this.original = original
+    this.rememberOriginalVisibility()
     this.applyVisibility()
   }
 
@@ -193,16 +208,36 @@ export class ReconstructionPreview<TTileset, TOriginal = unknown> {
   destroy(): void {
     if (this.destroyed) return
     this.destroyed = true
+    this.loadVersion += 1
     const loaded = this.currentTileset
     this.currentTileset = null
     this.currentUrl = null
-    if (loaded !== null) this.unmount(loaded)
-    // The original layer belongs to the host and intentionally remains intact.
-    this.applyVisibility()
+    try {
+      if (loaded !== null) this.unmount(loaded)
+    } finally {
+      this.restoreOriginalVisibility()
+    }
   }
 
   private assertAlive(): void {
     if (this.destroyed) throw new Error('ReconstructionPreview has been destroyed')
+  }
+
+  private rememberOriginalVisibility(): void {
+    forEachOriginal(this.original, (primitive) => {
+      const showable = asShowable(primitive)
+      if (showable && !this.originalVisibility.has(showable)) {
+        this.originalVisibility.set(showable, { hadShow: 'show' in showable, show: showable.show })
+      }
+    })
+  }
+
+  private restoreOriginalVisibility(): void {
+    for (const [primitive, original] of this.originalVisibility) {
+      if (original.hadShow) primitive.show = original.show
+      else delete primitive.show
+    }
+    this.originalVisibility.clear()
   }
 
   private applyVisibility(): void {

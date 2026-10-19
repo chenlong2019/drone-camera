@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { Quaternion as ThreeQuaternion, Vector3 as ThreeVector3 } from 'three'
 import {
   createEcefEnuFrame,
   ecefQuaternionToEnu,
@@ -19,6 +20,17 @@ describe('photogrammetry coordinate helpers', () => {
     expect(output.longitude).toBeCloseTo(input.longitude, 9)
     expect(output.latitude).toBeCloseTo(input.latitude, 9)
     expect(output.altitude).toBeCloseTo(input.altitude, 5)
+  })
+
+  it.each([1, -1])('uses the WGS84 polar radius at pole %s', (hemisphere) => {
+    const result = ecefToGeodetic([0, 0, hemisphere * (6356752.314245179 + 87)])
+    expect(result.longitude).toBe(0)
+    expect(result.latitude).toBe(hemisphere * 90)
+    expect(result.altitude).toBeCloseTo(87, 6)
+  })
+
+  it('rejects the geocentre because geodetic latitude and height are undefined', () => {
+    expect(() => ecefToGeodetic([0, 0, 0])).toThrow(/no defined geodetic coordinate/)
   })
 
   it('round-trips local ENU offsets around an origin', () => {
@@ -52,6 +64,51 @@ describe('photogrammetry coordinate helpers', () => {
     expect(result.position).toEqual([0, 0, 0])
     expect(result.coordinateFrame).toBe('local-enu')
     expect(result.rotationConvention).toContain('COLMAP')
+  })
+
+  it('exports COLMAP world-to-camera translation and a forward-facing projection', () => {
+    const result = cameraPoseToColmap({
+      position: [4, -2, 10],
+      rotation: [0, 0, 0, 1],
+      coordinateFrame: 'project-local',
+    }, { sourceCameraConvention: 'three' })
+    const [w, x, y, z] = result.qvec
+    const worldToCamera = new ThreeQuaternion(x, y, z, w)
+    const project = (point: [number, number, number]) =>
+      new ThreeVector3(...point).applyQuaternion(worldToCamera).add(new ThreeVector3(...result.tvec))
+
+    expect(result.coordinateFrame).toBe('project-local')
+    expect(result.tvec).toEqual([-4, -2, 10])
+    expect(project([4, -2, 10]).length()).toBeCloseTo(0, 10)
+    expect(project([4, -2, 0]).toArray()).toEqual([0, 0, 10])
+    const point = project([5, -3, 0])
+    expect(point.toArray()).toEqual([1, 1, 10])
+    expect(100 * point.x / point.z + 50).toBeCloseTo(60)
+    expect(100 * point.y / point.z + 40).toBeCloseTo(50)
+  })
+
+  it('inverts a rotated camera pose instead of writing its centre as translation', () => {
+    const result = cameraPoseToColmap({
+      position: [4, -2, 10],
+      rotation: [0, Math.SQRT1_2, 0, Math.SQRT1_2],
+      coordinateFrame: 'local-enu',
+    }, { sourceCameraConvention: 'three' })
+    const [w, x, y, z] = result.qvec
+    const cameraPoint = new ThreeVector3(-6, -3, 9)
+      .applyQuaternion(new ThreeQuaternion(x, y, z, w))
+      .add(new ThreeVector3(...result.tvec))
+    expect(cameraPoint.x).toBeCloseTo(1, 10)
+    expect(cameraPoint.y).toBeCloseTo(1, 10)
+    expect(cameraPoint.z).toBeCloseTo(10, 10)
+    expect(result.tvec[0]).toBeCloseTo(10, 10)
+    expect(result.tvec[1]).toBeCloseTo(-2, 10)
+    expect(result.tvec[2]).toBeCloseTo(4, 10)
+  })
+
+  it('rejects unknown world frames instead of labelling them ENU', () => {
+    expect(() => cameraPoseToColmap({
+      position: [1, 2, 3], rotation: [0, 0, 0, 1], coordinateFrame: 'unknown',
+    })).toThrow(/Unsupported camera coordinate frame/)
   })
 })
 

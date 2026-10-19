@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { Quaternion, Vector3 } from 'three'
 import {
   buildCaptureManifest,
   validateCaptureManifest,
@@ -60,6 +61,34 @@ describe('capture manifest', () => {
     expect(manifest.coordinateFrame.transform.matrix).toHaveLength(16)
     expect(manifest.images[0]?.rotationConvention).toContain('[x,y,z,w]')
     expect(manifest.images[0]?.file).toBe('images/img-0001.png')
+  })
+
+  it('exports equivalent matrix and TRS transforms with a known ENU basis', () => {
+    const input = session()
+    input.options.georeference = { longitude: 0, latitude: 0, altitude: 100 }
+    const transform = buildCaptureManifest(input).coordinateFrame.transform
+    const matrix = transform.matrix as number[]
+    const rotation = new Quaternion(...transform.rotation!)
+    const translation = new Vector3(...transform.translation!)
+    // At lon=0, lat=0, ECEF +Y is east, +Z is north, and +X is up.
+    const originX = 6378137 + 100
+    for (const [point, expected] of [
+      [[originX, 0, 0], [0, 0, 0]],
+      [[originX + 3, 1, 2], [1, 2, 3]],
+    ] as const) {
+      const throughTrs = new Vector3(...point)
+        .multiplyScalar(transform.scale!)
+        .applyQuaternion(rotation)
+        .add(translation)
+        .toArray()
+      const throughMatrix = [0, 4, 8].map((row) =>
+        matrix[row]! * point[0] + matrix[row + 1]! * point[1] + matrix[row + 2]! * point[2] + matrix[row + 3]!,
+      )
+      expected.forEach((value, axis) => {
+        expect(throughTrs[axis]).toBeCloseTo(value, 7)
+        expect(throughMatrix[axis]).toBeCloseTo(value, 7)
+      })
+    }
   })
 
   it('rejects missing pose and duplicate image content', () => {

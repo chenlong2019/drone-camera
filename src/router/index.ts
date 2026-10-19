@@ -5,6 +5,12 @@ const router = createRouter({
   routes: [
     { path: '/', redirect: '/three-demo' },
     {
+      path: '/photogrammetry-validation',
+      name: 'PhotogrammetryValidation',
+      component: () => import('../views/photogrammetry-validation/photogrammetry-validation.vue'),
+      meta: { title: '摄影测量验证', menu: true },
+    },
+    {
       path: '/three-demo',
       name: 'ThreeDemo',
       component: () => import('../views/three-demo/three-demo.vue'),

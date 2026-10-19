@@ -281,6 +281,12 @@ export class UseThreeDemo {
     })
     this.droneFly = fly
 
+    // 演示开关:`?unlimited=1` 取消限高 / 限距(内核 SimConfig.unlimitedFlight)。
+    // 拍高空机位、飞长航线时用;不带参数则仍是真机口径的 120 m / 500 m。
+    if (new URLSearchParams(window.location.search).get('unlimited') === '1') {
+      fly.sim.setConfig({ unlimitedFlight: true })
+    }
+
     // 把 demo 布景的碰撞盒并进仿真障碍物:库内 `sim.obstacles` 就是 world 那份 collisionBoxes 的引用,
     // 这里 push 进去 = **避障刹停 / 鹰眼图轮廓**都能看见 demo 自己搭的楼与地标,库侧一行都不用改。
     // (每次重建都是一个新 sim,所以在这里 push 不会累积重复。)

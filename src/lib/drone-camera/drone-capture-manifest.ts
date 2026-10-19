@@ -13,7 +13,7 @@ import type {
   CapturedImage,
   CoordinateFrame,
 } from './drone-capture'
-import { createEcefEnuFrame } from './drone-photogrammetry'
+import { createEcefEnuFrame, ecefToEnu } from './drone-photogrammetry'
 
 export const CAPTURE_MANIFEST_SCHEMA_VERSION = 1 as const
 
@@ -24,7 +24,7 @@ export interface CaptureManifestTransform {
   source: string
   /** Target frame expected by the reconstruction/export pipeline. */
   target: string
-  /** Optional translation in target units. */
+  /** Optional translation in target units: target = rotation * (scale * source) + translation. */
   translation?: [number, number, number]
   /** Optional active rotation, in quaternion [x, y, z, w] order. */
   rotation?: [number, number, number, number]
@@ -253,6 +253,7 @@ function coordinateFrameFromSession(
   const source = frames.length === 1 ? frameName(frames[0]) : frames.length > 1 ? 'mixed' : 'unknown'
   const origin = session.options.georeference
   const enuFrame = source === 'Cesium ECEF' && origin ? createEcefEnuFrame(origin) : null
+  const enuTranslation = enuFrame ? ecefToEnu([0, 0, 0], enuFrame) : null
   const transformParametersAvailable = source !== 'unknown' && source !== 'mixed' && (source !== 'Cesium ECEF' || enuFrame !== null)
   const defaultTransform: CaptureManifestTransform = {
     source,
@@ -273,9 +274,16 @@ function coordinateFrameFromSession(
           },
         }
       : {}),
-    ...(enuFrame
+    ...(enuFrame && enuTranslation
       ? {
           parametersAvailable: true,
+          translation: enuTranslation,
+          rotation: [
+            -enuFrame.enuToEcefRotation[0],
+            -enuFrame.enuToEcefRotation[1],
+            -enuFrame.enuToEcefRotation[2],
+            enuFrame.enuToEcefRotation[3],
+          ] as [number, number, number, number],
           ecefOrigin: [...enuFrame.ecefOrigin],
           basis: {
             east: [...enuFrame.east],
@@ -288,21 +296,15 @@ function coordinateFrameFromSession(
             enuFrame.east[0],
             enuFrame.east[1],
             enuFrame.east[2],
-            -(enuFrame.east[0] * enuFrame.ecefOrigin[0] +
-              enuFrame.east[1] * enuFrame.ecefOrigin[1] +
-              enuFrame.east[2] * enuFrame.ecefOrigin[2]),
+            enuTranslation[0],
             enuFrame.north[0],
             enuFrame.north[1],
             enuFrame.north[2],
-            -(enuFrame.north[0] * enuFrame.ecefOrigin[0] +
-              enuFrame.north[1] * enuFrame.ecefOrigin[1] +
-              enuFrame.north[2] * enuFrame.ecefOrigin[2]),
+            enuTranslation[1],
             enuFrame.up[0],
             enuFrame.up[1],
             enuFrame.up[2],
-            -(enuFrame.up[0] * enuFrame.ecefOrigin[0] +
-              enuFrame.up[1] * enuFrame.ecefOrigin[1] +
-              enuFrame.up[2] * enuFrame.ecefOrigin[2]),
+            enuTranslation[2],
             0,
             0,
             0,

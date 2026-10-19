@@ -322,6 +322,12 @@ export const API_MODULES: ApiModule[] = [
      },
      {
       "kind": "property",
+      "name": "unlimitedFlight",
+      "signature": "unlimitedFlight: boolean",
+      "doc": "取消高度与距离限制(演示 / 取景用),默认 `false`。"
+     },
+     {
+      "kind": "property",
       "name": "rthAltitude",
       "signature": "rthAltitude: number",
       "doc": "返航高度(米)"
@@ -392,7 +398,7 @@ export const API_MODULES: ApiModule[] = [
     "name": "DEFAULT_CONFIG",
     "kind": "const",
     "signature": "const DEFAULT_CONFIG: SimConfig",
-    "doc": "出厂默认参数:限高 120 m(合规上限)、限距 500 m、无风、实时",
+    "doc": "出厂默认参数:限高 120 m(合规上限)、限距 500 m、限高限距生效、无风、实时",
     "members": []
    },
    {
@@ -554,10 +560,17 @@ export const API_MODULES: ApiModule[] = [
     "members": []
    },
    {
+    "name": "MISSION_ALTITUDE_HARD_LIMIT",
+    "kind": "const",
+    "signature": "const MISSION_ALTITUDE_HARD_LIMIT = 500",
+    "doc": "航点高度的**硬上限**(米)。",
+    "members": []
+   },
+   {
     "name": "normalizeMissionWaypoint",
     "kind": "function",
-    "signature": "function normalizeMissionWaypoint(source: Partial<MissionWaypoint>): MissionWaypoint",
-    "doc": "单个航点字段归一化(手输/外部传入都可能越界)",
+    "signature": "function normalizeMissionWaypoint(source: Partial<MissionWaypoint>, maxAltitude?: number): MissionWaypoint",
+    "doc": "单个航点字段归一化(手输/外部传入都可能越界)。",
     "members": []
    },
    {
@@ -1509,6 +1522,24 @@ export const API_MODULES: ApiModule[] = [
       "name": "motorsOn",
       "signature": "get motorsOn(): boolean",
       "doc": "电机是否已启动(空中为 true;停桨后回 false)"
+     },
+     {
+      "kind": "getter",
+      "name": "altitudeCeiling",
+      "signature": "get altitudeCeiling(): number",
+      "doc": "当前生效的限高(米)。`unlimitedFlight` 打开时为 `Infinity`,即不夹。"
+     },
+     {
+      "kind": "getter",
+      "name": "distanceCeiling",
+      "signature": "get distanceCeiling(): number",
+      "doc": "当前生效的限距(米)。`unlimitedFlight` 打开时为 `Infinity`,即不夹。"
+     },
+     {
+      "kind": "method",
+      "name": "setConfig",
+      "signature": "setConfig(patch: Partial<SimConfig>): void",
+      "doc": "增量修改仿真配置(限高限距开关 / 风 / 电量阈值等),立即生效,只覆盖传入的字段。"
      },
      {
       "kind": "getter",
@@ -3597,6 +3628,12 @@ export const API_MODULES: ApiModule[] = [
       "name": "height",
       "signature": "height: number",
       "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "camera",
+      "signature": "camera?: CaptureCameraState",
+      "doc": "与该 PNG 同一渲染帧的取景相机快照。"
      }
     ]
    },
@@ -3984,7 +4021,7 @@ export const API_MODULES: ApiModule[] = [
       "kind": "method",
       "name": "setConfig",
       "signature": "setConfig(patch: Partial<SimConfig>): void",
-      "doc": "改仿真配置(限速/风/电量阈值等,立即生效)"
+      "doc": "改仿真配置(限速 / 限高限距开关 / 风 / 电量阈值等,立即生效)"
      },
      {
       "kind": "method",
@@ -6505,6 +6542,12 @@ export const API_MODULES: ApiModule[] = [
       "name": "height",
       "signature": "height: number",
       "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "camera",
+      "signature": "camera?: CaptureCameraState",
+      "doc": "可选的同一渲染帧相机快照。渲染后端应优先提供它。"
      }
     ]
    },
@@ -6649,7 +6692,7 @@ export const API_MODULES: ApiModule[] = [
    {
     "name": "CaptureExportFormat",
     "kind": "type",
-    "signature": "type CaptureExportFormat = 'json' | 'csv'",
+    "signature": "type CaptureExportFormat = 'json' | 'csv' | 'manifest'",
     "doc": "导出格式",
     "members": []
    },
@@ -6737,6 +6780,24 @@ export const API_MODULES: ApiModule[] = [
       "name": "getCaptureIntrinsics",
       "signature": "getCaptureIntrinsics(): CameraIntrinsics | null",
       "doc": "读取当前取景相机内参(未就绪或后端未提供时返回 null)。"
+     },
+     {
+      "kind": "method",
+      "name": "buildManifest",
+      "signature": "buildManifest(sessionId: string, options?: CaptureManifestOptions): CaptureManifest | null",
+      "doc": "将浏览器会话转换为可交给离线重建任务的 CaptureManifest。"
+     },
+     {
+      "kind": "method",
+      "name": "exportManifest",
+      "signature": "exportManifest(sessionId: string, options?: CaptureManifestOptions, space?: number): string",
+      "doc": "导出文档约定的 manifest.json 文本。影像二进制仍由宿主按 file/imageUrl 落盘。"
+     },
+     {
+      "kind": "method",
+      "name": "validateSession",
+      "signature": "validateSession(sessionId: string, options?: CaptureManifestOptions & CaptureValidatorOptions): CaptureValidationReport | null",
+      "doc": "在提交离线重建前运行 Manifest 质量门禁。"
      },
      {
       "kind": "method",

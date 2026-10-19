@@ -20,7 +20,11 @@ export interface ColmapCameraPose {
   position: Vector3
   /** Camera-local-to-world quaternion in COLMAP/OpenCV axes, [x,y,z,w]. */
   rotation: Quaternion
-  coordinateFrame: 'local-enu'
+  /** World-to-camera quaternion for COLMAP images.txt, [w,x,y,z]. */
+  qvec: [number, number, number, number]
+  /** World-to-camera translation for COLMAP images.txt: -R * position. */
+  tvec: Vector3
+  coordinateFrame: 'local-enu' | 'project-local'
   rotationConvention: 'camera-local-to-world; COLMAP +X right, +Y down, +Z forward'
 }
 
@@ -111,17 +115,21 @@ export function ecefToGeodetic(position: Vector3): GeodeticCoordinate {
   const horizontal = Math.hypot(x, y)
   const a = WGS84.semiMajorAxis
   const e2 = WGS84.eccentricitySquared
+  const b = a * Math.sqrt(1 - e2)
+
+  if (x === 0 && y === 0 && z === 0) {
+    throw new RangeError('The ECEF origin has no defined geodetic coordinate')
+  }
 
   // The polar case has no meaningful longitude, but zero is a stable and useful
   // value for manifests. Bowring's initial latitude followed by a few Newton
   // iterations is accurate to sub-millimetres for normal drone altitudes.
   if (horizontal < 1e-12) {
-    const latitude = Math.sign(z || 1) * 90
-    const altitude = Math.abs(z) - a * (1 - e2)
+    const latitude = Math.sign(z) * 90
+    const altitude = Math.abs(z) - b
     return { longitude: 0, latitude, altitude }
   }
 
-  const b = a * Math.sqrt(1 - e2)
   const theta = Math.atan2(z * a, horizontal * b)
   const sinTheta = Math.sin(theta)
   const cosTheta = Math.cos(theta)
@@ -342,12 +350,23 @@ export function cameraPoseToColmap(
     position = ecefToEnu(pose.position, options.enuFrame)
     rotation = ecefQuaternionToEnu(rotation, options.enuFrame)
   } else {
+    if (pose.coordinateFrame !== 'local-enu' && pose.coordinateFrame !== 'project-local') {
+      throw new RangeError(`Unsupported camera coordinate frame: ${pose.coordinateFrame}`)
+    }
     position = [...pose.position]
   }
+  const cameraToWorld = convertCameraQuaternion(rotation, sourceConvention, 'colmap')
+  const worldToCamera = quaternionConjugate(cameraToWorld)
+  const cameraCentre = quaternionMultiply(
+    quaternionMultiply(worldToCamera, [position[0], position[1], position[2], 0]),
+    cameraToWorld,
+  )
   return {
     position,
-    rotation: convertCameraQuaternion(rotation, sourceConvention, 'colmap'),
-    coordinateFrame: 'local-enu',
+    rotation: cameraToWorld,
+    qvec: [worldToCamera[3], worldToCamera[0], worldToCamera[1], worldToCamera[2]],
+    tvec: [-cameraCentre[0], -cameraCentre[1], -cameraCentre[2]],
+    coordinateFrame: pose.coordinateFrame === 'project-local' ? 'project-local' : 'local-enu',
     rotationConvention: 'camera-local-to-world; COLMAP +X right, +Y down, +Z forward',
   }
 }

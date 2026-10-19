@@ -403,8 +403,9 @@ export class DroneFly implements DronePanelHost {
           if (this.controls) this.controls.enabled = enabled && this.isOrbitView
         },
         getLimits: () => ({
-          maxAltitude: this.sim.config.maxAltitude,
-          maxDistance: this.sim.config.maxDistance,
+          // 用 ceiling 而不是 config 原值:unlimitedFlight 打开时是 Infinity,编辑器的夹紧自动失效
+          maxAltitude: this.sim.altitudeCeiling,
+          maxDistance: this.sim.distanceCeiling,
           homeX: this.sim.homePosition.x,
           homeZ: this.sim.homePosition.z,
         }),
@@ -1401,9 +1402,9 @@ export class DroneFly implements DronePanelHost {
     this.sim.setMode(mode)
   }
 
-  /** 改仿真配置(限速/风/电量阈值等,立即生效) */
+  /** 改仿真配置(限速 / 限高限距开关 / 风 / 电量阈值等,立即生效) */
   setConfig(patch: Partial<SimConfig>): void {
-    this.sim.config = { ...this.sim.config, ...patch }
+    this.sim.setConfig(patch)
   }
 
   /** 注入/清除故障标志(测失效保护用) */
