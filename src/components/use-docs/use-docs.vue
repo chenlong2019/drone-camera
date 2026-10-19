@@ -18,6 +18,7 @@
           {{ item.label }}
         </a>
         <a class="docs-nav-item docs-nav-api" @click="goApiDocs">API 参考</a>
+        <a class="docs-nav-item docs-nav-api" @click="goClassMap">类与方法</a>
         <button type="button" class="docs-back" @click="onBack">
           <span class="docs-back-arrow">←</span>
           返回演示
@@ -283,6 +284,10 @@ function goPanorama(): void {
 
 function goApiDocs(): void {
   void router.push('/api-docs')
+}
+
+function goClassMap(): void {
+  void router.push('/class-map')
 }
 
 function onBack(): void {

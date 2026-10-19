@@ -29,12 +29,6 @@ import type {
 import type { MissionEditState } from './mission-editor'
 
 /**
- * 控制面板 / 航线面板 / 鹰眼图所需的最小飞行控制能力集。
- *
- * `DroneFly`(three.js 实现)与各渲染器适配器均实现本接口;面板只读真值、只调方法,
- * 不触碰任何引擎对象,所以换渲染器时面板一行都不用改。
- */
-/**
  * 航点的地理坐标(经纬高,WGS84 椭球),由支持地理坐标系的后端(如 Cesium)提供。
  *
  * 与航点列表里的本地米坐标(x 东 / z 南 / altitude AGL,相对返航点)是同一位置的两种表示:
@@ -49,6 +43,12 @@ export interface WaypointGeo {
   height: number
 }
 
+/**
+ * 控制面板 / 航线面板 / 鹰眼图所需的最小飞行控制能力集。
+ *
+ * `DroneFly`(three.js 实现)与各渲染器适配器均实现本接口;面板只读真值、只调方法,
+ * 不触碰任何引擎对象,所以换渲染器时面板一行都不用改。
+ */
 export interface DronePanelHost {
   /** 飞行内核:面板直接读取 gimbalPitch / photoCount / recordSeconds / stick 等真值 */
   readonly sim: DroneSim

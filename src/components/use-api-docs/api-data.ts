@@ -1906,6 +1906,32 @@ export const API_MODULES: ApiModule[] = [
   "doc": "渲染器无关的「飞行控制」抽象层。",
   "items": [
    {
+    "name": "WaypointGeo",
+    "kind": "interface",
+    "signature": "interface WaypointGeo { … }",
+    "doc": "航点的地理坐标(经纬高,WGS84 椭球),由支持地理坐标系的后端(如 Cesium)提供。",
+    "members": [
+     {
+      "kind": "property",
+      "name": "lon",
+      "signature": "lon: number",
+      "doc": "经度(度)"
+     },
+     {
+      "kind": "property",
+      "name": "lat",
+      "signature": "lat: number",
+      "doc": "纬度(度)"
+     },
+     {
+      "kind": "property",
+      "name": "height",
+      "signature": "height: number",
+      "doc": "海拔(米,绝对高程 = 地形 + AGL)"
+     }
+    ]
+   },
+   {
     "name": "DronePanelHost",
     "kind": "interface",
     "signature": "interface DronePanelHost { … }",
@@ -2024,6 +2050,18 @@ export const API_MODULES: ApiModule[] = [
       "name": "resetCamera",
       "signature": "resetCamera(): void",
       "doc": "视角复位"
+     },
+     {
+      "kind": "method",
+      "name": "flyTo",
+      "signature": "flyTo(target: { x?: number; y?: number; z?: number; heading?: number; pitch?: number; roll?: number; }): void",
+      "doc": "直接把无人机移动到目标位置(本地坐标 / 绝对姿态)"
+     },
+     {
+      "kind": "method",
+      "name": "zoomTo",
+      "signature": "zoomTo(zoom: number): void",
+      "doc": "设定镜头/云台变焦倍数(1~4x)"
      },
      {
       "kind": "method",
@@ -2224,6 +2262,24 @@ export const API_MODULES: ApiModule[] = [
       "name": "frameMission",
       "signature": "frameMission(): boolean",
       "doc": "把视角拉到\"一眼看全整条航线\"的位置;成功返回 true"
+     },
+     {
+      "kind": "method",
+      "name": "supportsGeoCoordinates",
+      "signature": "supportsGeoCoordinates(): boolean",
+      "doc": "后端是否支持地理坐标(经纬高)。Cesium 等地理渲染器返回 true,three 等本地米坐标系返回 false。 面板据此决定是否显示\"经纬度 / XYZ\"坐标切换开关。"
+     },
+     {
+      "kind": "method",
+      "name": "getWaypointGeo",
+      "signature": "getWaypointGeo(index: number): WaypointGeo | null",
+      "doc": "取某航点的地理坐标(经纬高);不支持或越界返回 null"
+     },
+     {
+      "kind": "method",
+      "name": "setWaypointGeo",
+      "signature": "setWaypointGeo(index: number, geo: WaypointGeo): boolean",
+      "doc": "用地理坐标原地改写一个航点(经纬高 → 本地米坐标的逆向换算由实现方完成)。 Cesium 后端可写;three 等本地米坐标系无地理锚点,返回 false(面板仅在 geo 模式且 supportsGeoCoordinates() 为 true 时才调用,故 three 不会走到这里)。"
      }
     ]
    }
@@ -2289,6 +2345,12 @@ export const API_MODULES: ApiModule[] = [
       "name": "color",
       "signature": "color: number",
       "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "baseY",
+      "signature": "baseY?: number",
+      "doc": "底面离地高度(米)。默认 0 = 落地障碍物;>0 = 悬空障碍物(天桥等),机体上方测距用"
      }
     ]
    },
@@ -3491,7 +3553,26 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface GimbalStabilizationOptions { … }",
     "doc": "云台增稳可调项(见 DroneFly.configureGimbal)",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "stabilization",
+      "signature": "stabilization?: GimbalStabilization",
+      "doc": "增稳档位,默认 'full'"
+     },
+     {
+      "kind": "property",
+      "name": "response",
+      "signature": "response?: number",
+      "doc": "云台关节一阶跟随时间常数(秒):0 = 立即到位,默认 0.02(20 ms)。 只作用于**模型外观**(云台看起来像无刷电机一样有响应时间); `full` 档下相机不采样关节,所以不会因为滞后而晃。"
+     },
+     {
+      "kind": "property",
+      "name": "smoothing",
+      "signature": "smoothing?: number",
+      "doc": "电子增稳强度 0~1:0 = 关闭,默认 0(解耦后目标姿态已无噪声,低通只会加滞后)"
+     }
+    ]
    },
    {
     "name": "PhotoShot",
@@ -3524,7 +3605,20 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface DroneFlyInitializeOptions { … }",
     "doc": "DroneFly.initialize() 的可选配置",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "modelUrl",
+      "signature": "modelUrl?: string",
+      "doc": "机体模型 GLB 地址(URL 或相对路径)。 **不传 = 用内置的「积木无人机」**(程序化几何体拼出来的四轴,零资产依赖, 见 `createHuskyDroneModel`);需要真机模型时再传,例如 `DRONE_MODEL_URL`。"
+     },
+     {
+      "kind": "property",
+      "name": "obstacles",
+      "signature": "obstacles?: ObstacleSpec[]",
+      "doc": "场景里的障碍物(建筑 / 灯杆 / 天桥 / 树…… 都是 AABB 盒),同一份数据既生成可视网格, 又喂给飞控做避障判定 —— 换了坐标,画面和碰撞会一起变。 缺省用内置的 `DEFAULT_OBSTACLES`(起飞点 30 米内的 7 个参考物);"
+     }
+    ]
    },
    {
     "name": "DroneFly",
@@ -3699,6 +3793,18 @@ export const API_MODULES: ApiModule[] = [
       "name": "isOrbitView",
       "signature": "get isOrbitView(): boolean",
       "doc": "当前是否为观察者(轨道控制)视角;非轨道模式下渲染循环不得调用 controls.update(),否则其每帧 lookAt(target) 会覆盖机载/跟随朝向"
+     },
+     {
+      "kind": "method",
+      "name": "flyTo",
+      "signature": "flyTo(target: { x?: number; y?: number; z?: number; heading?: number; pitch?: number; roll?: number; }): void",
+      "doc": "直接把无人机移动到目标位置并同步观察点/朝向"
+     },
+     {
+      "kind": "method",
+      "name": "zoomTo",
+      "signature": "zoomTo(zoom: number): void",
+      "doc": "直接调整镜头/云台变焦倍数(1~4x),并同步当前机载视角"
      },
      {
       "kind": "method",
@@ -4032,6 +4138,24 @@ export const API_MODULES: ApiModule[] = [
      },
      {
       "kind": "method",
+      "name": "supportsGeoCoordinates",
+      "signature": "supportsGeoCoordinates(): boolean",
+      "doc": "three 后端是本地米坐标系,没有地理坐标;经纬度切换开关因此不显示"
+     },
+     {
+      "kind": "method",
+      "name": "getWaypointGeo",
+      "signature": "getWaypointGeo(_index: number): { lon: number; lat: number; height: number; } | null",
+      "doc": "three 后端无经纬高:返回 null(面板始终走 XYZ 显示)"
+     },
+     {
+      "kind": "method",
+      "name": "setWaypointGeo",
+      "signature": "setWaypointGeo(_index: number, _geo: { lon: number; lat: number; height: number; }): boolean",
+      "doc": "three 后端是本地米坐标系,无地理锚点,经纬度编辑不可用;接口占位返回 false"
+     },
+     {
+      "kind": "method",
       "name": "setMissionEditEnabled",
       "signature": "setMissionEditEnabled(enabled: boolean): void",
       "doc": "开关「场景内编辑航点」"
@@ -4276,6 +4400,54 @@ export const API_MODULES: ApiModule[] = [
       "name": "viewer",
       "signature": "viewer: CesiumNS",
       "doc": "Cesium.Viewer 实例"
+     },
+     {
+      "kind": "property",
+      "name": "cesium",
+      "signature": "cesium?: CesiumNS",
+      "doc": "Cesium 命名空间。缺省取 `window.Cesium`(配合 `loadCesiumScript()` 或页面里自引脚本); 传进来可让同一页面挂多个互不干扰的 Cesium 版本 / 便于测试注入。"
+     },
+     {
+      "kind": "property",
+      "name": "lon",
+      "signature": "lon?: number",
+      "doc": "沙盒原点经纬度(度);高度缺省时自动采样地形"
+     },
+     {
+      "kind": "property",
+      "name": "lat",
+      "signature": "lat?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "height",
+      "signature": "height?: number",
+      "doc": "锚点海拔(米);不传则用 sampleTerrainMostDetailed 采样"
+     },
+     {
+      "kind": "property",
+      "name": "modelIndex",
+      "signature": "modelIndex?: number",
+      "doc": "初始机体下标(见 DRONE_MODELS),默认 0"
+     },
+     {
+      "kind": "property",
+      "name": "groundClearance",
+      "signature": "groundClearance?: number",
+      "doc": "起降点离地额外抬升(米),避免机腹与地形 z-fighting,默认 0.05"
+     },
+     {
+      "kind": "property",
+      "name": "followRange",
+      "signature": "followRange?: number",
+      "doc": "视角跟随距离(米),follow 模式用(相机在无人机正后方),默认 7.5(与 three 版一致)"
+     },
+     {
+      "kind": "property",
+      "name": "stripRequiredExtensions",
+      "signature": "stripRequiredExtensions?: readonly string[]",
+      "doc": "加载期从 GLB 的 `extensionsRequired` 里摘掉的扩展清单 (见 DEFAULT_UNSUPPORTED_REQUIRED_EXTENSIONS,默认 ['KHR_lights_punctual']); 传 `[]` 关闭净化,直接按原 URL 加载。"
      }
     ]
    },
@@ -4488,6 +4660,18 @@ export const API_MODULES: ApiModule[] = [
      },
      {
       "kind": "method",
+      "name": "flyTo",
+      "signature": "flyTo(target: { x?: number; y?: number; z?: number; heading?: number; pitch?: number; roll?: number; }): void",
+      "doc": "直接把无人机移动到目标本地坐标位置,并保持离地高度不低于地形"
+     },
+     {
+      "kind": "method",
+      "name": "zoomTo",
+      "signature": "zoomTo(zoom: number): void",
+      "doc": "设定相机变焦倍数(1~4x),保持和 three 后端一致"
+     },
+     {
+      "kind": "method",
       "name": "setCaptureView",
       "signature": "setCaptureView(override: CaptureViewOverride | null): void",
       "doc": "设置取景**俯仰**覆盖 —— 全景扫描(180° / 360°)按俯仰层逐张取景的入口;传 `null` 复位。 与 three 版 `DroneFly.setCaptureView` 同语义:俯仰替代云台俯仰;只影响取景相机 (`gimbalCameraView` 一处生效),拍照 / 录像 / 采集快照三条路径自动同源。"
@@ -4671,6 +4855,24 @@ export const API_MODULES: ApiModule[] = [
       "name": "isMissionPathVisible",
       "signature": "isMissionPathVisible(): boolean",
       "doc": ""
+     },
+     {
+      "kind": "method",
+      "name": "supportsGeoCoordinates",
+      "signature": "supportsGeoCoordinates(): boolean",
+      "doc": "地理坐标(经纬高)在 Cesium 后端始终可用"
+     },
+     {
+      "kind": "method",
+      "name": "getWaypointGeo",
+      "signature": "getWaypointGeo(index: number): { lon: number; lat: number; height: number; } | null",
+      "doc": "取某航点的地理坐标(经纬高,WGS84)。"
+     },
+     {
+      "kind": "method",
+      "name": "setWaypointGeo",
+      "signature": "setWaypointGeo(index: number, geo: { lon: number; lat: number; height: number; }): boolean",
+      "doc": "用地理坐标原地改写一个航点:经纬高 → 本地米坐标的逆向换算。 `Cartesian3.fromDegrees` 投到 ECEF,再用 `worldToLocalXZ` 取回本地水平坐标(x 东 / z 南); 海拔绝对高程减去锚点海拔即 AGL,交给 `updateMissionWaypoint` 夹紧到合法范围。"
      },
      {
       "kind": "method",
@@ -4957,6 +5159,12 @@ export const API_MODULES: ApiModule[] = [
     "members": [
      {
       "kind": "property",
+      "name": "engine",
+      "signature": "engine?: 'three'",
+      "doc": "后端标识;缺省 'three'"
+     },
+     {
+      "kind": "property",
       "name": "scene",
       "signature": "scene: THREE.Scene<THREE.Object3DEventMap>",
       "doc": ""
@@ -4971,6 +5179,12 @@ export const API_MODULES: ApiModule[] = [
       "kind": "property",
       "name": "renderer",
       "signature": "renderer: WebGPURenderer",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "controls",
+      "signature": "controls?: OrbitControls<THREE.Camera> | null",
       "doc": ""
      }
     ]
@@ -5038,7 +5252,134 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface DroneControlPanelOptions { … }",
     "doc": "DroneControlPanel 构造选项",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "container",
+      "signature": "container?: HTMLElement | null",
+      "doc": "挂载容器;缺省挂到 document.body(此时面板与悬浮层改用 fixed 定位)"
+     },
+     {
+      "kind": "property",
+      "name": "position",
+      "signature": "position?: DronePanelPosition",
+      "doc": "面板停靠位置,默认 'top-right';左右轮盘固定悬浮在画面两下角,不受此项影响"
+     },
+     {
+      "kind": "property",
+      "name": "title",
+      "signature": "title?: string",
+      "doc": "面板标题,默认「无人机」"
+     },
+     {
+      "kind": "property",
+      "name": "injectStyles",
+      "signature": "injectStyles?: boolean",
+      "doc": "是否注入自带样式,默认 true;关闭后仅保留 `dcp-*` 类名,由宿主自行配色"
+     },
+     {
+      "kind": "property",
+      "name": "pitchPresets",
+      "signature": "pitchPresets?: number[]",
+      "doc": "云台俯仰快捷档位(度),默认 [-90, -30, -10, 0]"
+     },
+     {
+      "kind": "property",
+      "name": "visible",
+      "signature": "visible?: boolean",
+      "doc": "初始是否可见,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "onPhoto",
+      "signature": "onPhoto?: (shot: PhotoShot) => void",
+      "doc": "拍照完成回调;未提供且 autoDownload 为 true 时自动下载 PNG"
+     },
+     {
+      "kind": "property",
+      "name": "captureService",
+      "signature": "captureService?: CaptureService",
+      "doc": "采集服务(可选)。提供后面板出现「拍摄模式」区,可切换广角 / 180° / 360°: 全景按预设网格逐张取景拍摄,每张都带全景分组信息登记进这个服务的当前会话。"
+     },
+     {
+      "kind": "property",
+      "name": "panorama",
+      "signature": "panorama?: boolean",
+      "doc": "是否启用全景拍摄(默认 true);没有 `captureService` 时不显示该区"
+     },
+     {
+      "kind": "property",
+      "name": "panoramaShotIntervalMs",
+      "signature": "panoramaShotIntervalMs?: number",
+      "doc": "全景每张之间的间隔(毫秒),默认 120"
+     },
+     {
+      "kind": "property",
+      "name": "onRecording",
+      "signature": "onRecording?: (blob: Blob, seconds: number) => void",
+      "doc": "录像完成回调;未提供且 autoDownload 为 true 时自动下载 webm"
+     },
+     {
+      "kind": "property",
+      "name": "autoDownload",
+      "signature": "autoDownload?: boolean",
+      "doc": "无自定义回调时是否自动下载产物,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "syncIntervalMs",
+      "signature": "syncIntervalMs?: number",
+      "doc": "状态轮询间隔(毫秒),默认 200;传 0 关闭自动同步、完全由宿主调 sync()"
+     },
+     {
+      "kind": "property",
+      "name": "stickDeadzone",
+      "signature": "stickDeadzone?: number",
+      "doc": "摇杆死区(0~1),默认 0.06;小于该幅值视为 0,抵住手指轻微抖动。作用于垂直通道(升降 / 前后)"
+     },
+     {
+      "kind": "property",
+      "name": "stickLateralDeadzone",
+      "signature": "stickLateralDeadzone?: number",
+      "doc": "横滚 / 偏航死区(0~1),默认 0.14。比垂直通道大一档 —— 触屏推杆时手指很难保证绝对竖直, 轻微的侧向分量会被放大成持续横移和机头偏转,几分钟就飞出弧线。加大这一路死区等于给 直线飞行留出一条\"安全走廊\",垂直通道不受影响、起手依然跟手。"
+     },
+     {
+      "kind": "property",
+      "name": "stickExpo",
+      "signature": "stickExpo?: number",
+      "doc": "摇杆指数曲线 expo(0~1),默认 0.55,真机遥控器的 expo 手感: 输出 = expo·v³ + (1-expo)·v —— 中位附近行程放慢(便于精确微调), 末端仍能打满舵量(1 处恒等于 1),推到底的极速与转向权限不受影响。"
+     },
+     {
+      "kind": "property",
+      "name": "yawRateScale",
+      "signature": "yawRateScale?: number",
+      "doc": "偏航角速度缩放(0~1],默认 0.6。左杆左右 / ←→ 键的转向输出乘这个系数 —— 飞控的挡位角速度是照真机标的(普通挡 100°/s,满杆 3.6 秒转一圈), 在屏幕遥控器上偏快;这里只压遥控器侧的输出,飞控与挡位表不动。"
+     },
+     {
+      "kind": "property",
+      "name": "keyboard",
+      "signature": "keyboard?: boolean",
+      "doc": "是否启用键盘控制,默认 true。键位(与屏上双摇杆等效,左手 WASD 对左杆、右手方向键对右杆): `W/S` 升降 · `A/D` 转向(左杆) · `↑/↓` 前后 · `←/→` 横滚(右杆);`Q/E` 是转向的备用键。 另外两组技能快捷键:`Ctrl`(macOS 上 `Cmd`)+ `K` 拍照、`Ctrl` + `L` 录像(开关,再按一次停止),"
+     },
+     {
+      "kind": "property",
+      "name": "keyboardRiseSeconds",
+      "signature": "keyboardRiseSeconds?: number",
+      "doc": "键盘推杆渐推时间(秒),默认 0.45;越大越柔和"
+     },
+     {
+      "kind": "property",
+      "name": "keyboardFallSeconds",
+      "signature": "keyboardFallSeconds?: number",
+      "doc": "键盘松手渐回时间(秒),默认 0.18"
+     },
+     {
+      "kind": "property",
+      "name": "adaptive",
+      "signature": "adaptive?: boolean",
+      "doc": "是否启用移动端自适应(横屏紧凑布局 / 触控尺寸),默认 true"
+     }
+    ]
    },
    {
     "name": "DroneControlPanel",
@@ -5167,7 +5508,68 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface MissionPanelOptions { … }",
     "doc": "MissionPanel 构造选项",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "container",
+      "signature": "container?: HTMLElement | null",
+      "doc": "挂载容器;缺省挂到 document.body(此时面板改用 fixed 定位)"
+     },
+     {
+      "kind": "property",
+      "name": "position",
+      "signature": "position?: MissionPanelPosition",
+      "doc": "面板停靠位置,默认 'top-left'(通常与右上角的飞行控制面板对开)"
+     },
+     {
+      "kind": "property",
+      "name": "title",
+      "signature": "title?: string",
+      "doc": "面板标题,默认「航线规划」"
+     },
+     {
+      "kind": "property",
+      "name": "injectStyles",
+      "signature": "injectStyles?: boolean",
+      "doc": "是否注入自带样式,默认 true;关闭后仅保留 `dmp-*` 类名,由宿主自行配色"
+     },
+     {
+      "kind": "property",
+      "name": "visible",
+      "signature": "visible?: boolean",
+      "doc": "初始是否可见,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "syncIntervalMs",
+      "signature": "syncIntervalMs?: number",
+      "doc": "状态轮询间隔(毫秒),默认 100;传 0 关闭自动同步、完全由宿主调 sync()"
+     },
+     {
+      "kind": "property",
+      "name": "sceneEdit",
+      "signature": "sceneEdit?: boolean",
+      "doc": "是否渲染「场景内编辑」区块(需要画布与观察者视角),默认 true;传 false 退化成三块纯列表编辑"
+     },
+     {
+      "kind": "property",
+      "name": "adaptive",
+      "signature": "adaptive?: boolean",
+      "doc": "是否启用移动端自适应(窄屏紧凑布局),默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "offset",
+      "signature": "offset?: { x?: number; y?: number; }",
+      "doc": "停靠微调(像素),与 DroneCapturePanel 同语义:y 对 top 方位= marginTop(下移)、 对 bottom 方位= marginBottom(上移);x 对 right 方位= marginRight(左移)、其余= marginLeft。 用来避开宿主自己的边角 UI(如 Cesium 的工具条 / 其他面板)。"
+     },
+     {
+      "kind": "property",
+      "name": "onExport",
+      "signature": "onExport?: (payload: MissionExportPayload) => void",
+      "doc": "「导出航线」的回调。**给了就由宿主接管保存**(上传服务器 / 写数据库 / 自定义文件名), 面板不再触发浏览器下载;不给则默认下载到本地(JSON / CSV,文件名带时间戳)。"
+     }
+    ]
    },
    {
     "name": "MissionPanel",
@@ -5252,7 +5654,98 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface MiniMapOptions { … }",
     "doc": "",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "container",
+      "signature": "container?: HTMLElement",
+      "doc": "挂载容器;缺省挂到 document.body(贴视口),给了容器就贴容器(必要时自动补 relative)"
+     },
+     {
+      "kind": "property",
+      "name": "position",
+      "signature": "position?: MiniMapPosition",
+      "doc": "吸附角,默认右下角(与控制面板右上、航线面板左上错开)"
+     },
+     {
+      "kind": "property",
+      "name": "offset",
+      "signature": "offset?: { x?: number; y?: number; }",
+      "doc": "角内偏移(像素):在默认 14px 边距之上再让出的距离。 右下角常被 HUD 摇杆 + 技能钮占着,demo 里就是用它把小地图抬到轮盘上方。"
+     },
+     {
+      "kind": "property",
+      "name": "size",
+      "signature": "size?: number",
+      "doc": "画布边长(CSS 像素),默认 186"
+     },
+     {
+      "kind": "property",
+      "name": "range",
+      "signature": "range?: number | null",
+      "doc": "固定半量程(米);传了就关闭自动量程。缺省 null = 自动跟随"
+     },
+     {
+      "kind": "property",
+      "name": "minRange",
+      "signature": "minRange?: number",
+      "doc": "自动量程下限(米),默认 40"
+     },
+     {
+      "kind": "property",
+      "name": "maxRange",
+      "signature": "maxRange?: number",
+      "doc": "自动量程上限(米),默认 300"
+     },
+     {
+      "kind": "property",
+      "name": "visible",
+      "signature": "visible?: boolean",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "injectStyles",
+      "signature": "injectStyles?: boolean",
+      "doc": "注入内置样式,默认 true;宿主自备样式可关掉"
+     },
+     {
+      "kind": "property",
+      "name": "className",
+      "signature": "className?: string",
+      "doc": "额外类名,追加在 `dcm` 之后"
+     },
+     {
+      "kind": "property",
+      "name": "showObstacles",
+      "signature": "showObstacles?: boolean",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "showMission",
+      "signature": "showMission?: boolean",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "showTrail",
+      "signature": "showTrail?: boolean",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "showFov",
+      "signature": "showFov?: boolean",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "showGrid",
+      "signature": "showGrid?: boolean",
+      "doc": ""
+     }
+    ]
    },
    {
     "name": "MiniMapStats",
@@ -5398,7 +5891,32 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface ExifGps { … }",
     "doc": "EXIF GPS 信息(已转成十进制度)",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "latitude",
+      "signature": "latitude?: number",
+      "doc": "十进制度,北纬为正"
+     },
+     {
+      "kind": "property",
+      "name": "longitude",
+      "signature": "longitude?: number",
+      "doc": "十进制度,东经为正"
+     },
+     {
+      "kind": "property",
+      "name": "altitude",
+      "signature": "altitude?: number",
+      "doc": "海拔(米);altitudeRef = 1 表示海平面以下,此处已取负"
+     },
+     {
+      "kind": "property",
+      "name": "altitudeRef",
+      "signature": "altitudeRef?: number",
+      "doc": "原始海拔标志:0 = 海平面以上,1 = 海平面以下"
+     }
+    ]
    },
    {
     "name": "ExifData",
@@ -5406,6 +5924,90 @@ export const API_MODULES: ApiModule[] = [
     "signature": "interface ExifData { … }",
     "doc": "EXIF 解析结果(字段全部可选 —— 缺失就是缺失,不填默认值)",
     "members": [
+     {
+      "kind": "property",
+      "name": "make",
+      "signature": "make?: string",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "model",
+      "signature": "model?: string",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "lensModel",
+      "signature": "lensModel?: string",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "dateTimeOriginal",
+      "signature": "dateTimeOriginal?: string",
+      "doc": "原始拍摄时间(相机本地时间,无时区),格式 `YYYY-MM-DDTHH:MM:SS`"
+     },
+     {
+      "kind": "property",
+      "name": "dateTime",
+      "signature": "dateTime?: string",
+      "doc": "文件修改时间(EXIF DateTime)"
+     },
+     {
+      "kind": "property",
+      "name": "orientation",
+      "signature": "orientation?: number",
+      "doc": "拍照方向(1~8,见 EXIF 规范;1 = 正常)"
+     },
+     {
+      "kind": "property",
+      "name": "focalLengthMm",
+      "signature": "focalLengthMm?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "focalLength35mm",
+      "signature": "focalLength35mm?: number",
+      "doc": "35mm 等效焦距 —— 换算内参的关键字段"
+     },
+     {
+      "kind": "property",
+      "name": "exposureTimeSeconds",
+      "signature": "exposureTimeSeconds?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "fNumber",
+      "signature": "fNumber?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "isoSpeed",
+      "signature": "isoSpeed?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "pixelXDimension",
+      "signature": "pixelXDimension?: number",
+      "doc": "图像宽高(EXIF 里记录的原始像素尺寸)"
+     },
+     {
+      "kind": "property",
+      "name": "pixelYDimension",
+      "signature": "pixelYDimension?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "gps",
+      "signature": "gps?: ExifGps",
+      "doc": ""
+     },
      {
       "kind": "property",
       "name": "warnings",
@@ -5471,6 +6073,48 @@ export const API_MODULES: ApiModule[] = [
      },
      {
       "kind": "property",
+      "name": "fx",
+      "signature": "fx?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "fy",
+      "signature": "fy?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "cx",
+      "signature": "cx?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "cy",
+      "signature": "cy?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "horizontalFovDeg",
+      "signature": "horizontalFovDeg?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "verticalFovDeg",
+      "signature": "verticalFovDeg?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "distortion",
+      "signature": "distortion?: number[]",
+      "doc": ""
+     },
+     {
+      "kind": "property",
       "name": "calibrationSource",
       "signature": "calibrationSource: 'known' | 'exif' | 'estimated' | 'unknown'",
       "doc": ""
@@ -5528,7 +6172,14 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface CaptureViewOverride { … }",
     "doc": "取景**俯仰**覆盖 —— 让取景相机临时偏离\"云台当前俯仰\"的常态。",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "pitch",
+      "signature": "pitch?: number",
+      "doc": "俯仰(度):**替代**云台俯仰 —— 即该张照片相对水平面的绝对俯仰角。 不给则沿用云台当前俯仰。全景网格给的是绝对值,否则用户把云台压到 -90° 后全景会全朝地面。"
+     }
+    ]
    },
    {
     "name": "PanoramaShotRef",
@@ -5546,7 +6197,7 @@ export const API_MODULES: ApiModule[] = [
       "kind": "property",
       "name": "mode",
       "signature": "mode: string",
-      "doc": "全景模式标识(`pano-wide` / `pano-180` / `pano-360`);这里用 string 以免与 drone-panorama 形成循环依赖"
+      "doc": "全景模式标识(`pano-wide` / `pano-180` / `pano-360`);这里用 string 以免形成循环依赖"
      },
      {
       "kind": "property",
@@ -5591,7 +6242,20 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface VirtualCaptureOptions { … }",
     "doc": "虚拟采集的附加参数",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "view",
+      "signature": "view?: CaptureViewOverride | null",
+      "doc": "本次取景的俯仰覆盖(用完自动复位;见 CaptureViewOverride)"
+     },
+     {
+      "kind": "property",
+      "name": "panorama",
+      "signature": "panorama?: PanoramaShotRef",
+      "doc": "本次取景属于哪个全景组"
+     }
+    ]
    },
    {
     "name": "CapturedImage",
@@ -5637,6 +6301,30 @@ export const API_MODULES: ApiModule[] = [
      },
      {
       "kind": "property",
+      "name": "imageUrl",
+      "signature": "imageUrl?: string",
+      "doc": "预览地址:虚拟 = PNG data URL,真实 = Blob URL(仅浏览器内有效)"
+     },
+     {
+      "kind": "property",
+      "name": "localBlob",
+      "signature": "localBlob?: Blob",
+      "doc": "只用于浏览器内短期数据流,**不得写入服务端数据库**(见模块头)"
+     },
+     {
+      "kind": "property",
+      "name": "cameraIntrinsics",
+      "signature": "cameraIntrinsics?: CameraIntrinsics",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "cameraPose",
+      "signature": "cameraPose?: CameraPose",
+      "doc": ""
+     },
+     {
+      "kind": "property",
       "name": "metadata",
       "signature": "metadata: { latitude?: number; longitude?: number; altitude?: number; cameraModel?: string; sceneId?: string; sceneVersion?: string; dronePoseId?: string; gimbalRotation?: [number, number, number, number]; gpsAccuracyMeters?: number; rtkFixed?: boolean; /** 虚拟影像的产出后端(three / cesium),便于区分同页两套后端的采集结果 */ engine?: string; /** 全景扫描定位(属于某次 180°/360° 拍摄时才有) */ panorama?: PanoramaShotRef; /** 真实照片的原始 EXIF(保留原始字段,避免二次解析丢信息) */ exif?: ExifData; }",
       "doc": ""
@@ -5666,6 +6354,42 @@ export const API_MODULES: ApiModule[] = [
       "name": "name",
       "signature": "name: string",
       "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "captureIntervalMs",
+      "signature": "captureIntervalMs?: number",
+      "doc": "自动采集的时间间隔(毫秒);0 / 缺省 = 不按时间触发"
+     },
+     {
+      "kind": "property",
+      "name": "distanceIntervalMeters",
+      "signature": "distanceIntervalMeters?: number",
+      "doc": "自动采集的距离间隔(米);0 / 缺省 = 不按距离触发"
+     },
+     {
+      "kind": "property",
+      "name": "includeCameraMetadata",
+      "signature": "includeCameraMetadata?: boolean",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "sceneId",
+      "signature": "sceneId?: string",
+      "doc": "虚拟场景标识(便于回溯「这批影像出自哪个版本的场景」)"
+     },
+     {
+      "kind": "property",
+      "name": "sceneVersion",
+      "signature": "sceneVersion?: string",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "georeference",
+      "signature": "georeference?: GeoreferenceOrigin",
+      "doc": "地理参考原点:给了它,局部 ENU 坐标同时能换算成经纬度"
      }
     ]
    },
@@ -5685,6 +6409,12 @@ export const API_MODULES: ApiModule[] = [
       "kind": "property",
       "name": "latitude",
       "signature": "latitude: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "altitude",
+      "signature": "altitude?: number",
       "doc": ""
      }
     ]
@@ -5737,6 +6467,12 @@ export const API_MODULES: ApiModule[] = [
       "name": "updatedAt",
       "signature": "updatedAt: string",
       "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "engine",
+      "signature": "engine?: string",
+      "doc": "产出后端(虚拟采集时由 provider 提供)"
      },
      {
       "kind": "property",
@@ -5795,6 +6531,24 @@ export const API_MODULES: ApiModule[] = [
       "name": "frame",
       "signature": "frame: { width: number; height: number; }",
       "doc": "成片画幅(像素)"
+     },
+     {
+      "kind": "property",
+      "name": "scene",
+      "signature": "scene?: { id?: string; version?: string; }",
+      "doc": "场景标识"
+     },
+     {
+      "kind": "property",
+      "name": "drone",
+      "signature": "drone?: { position: [number, number, number]; heading: number; tiltPitch: number; tiltRoll: number; gimbalPitch: number; gimbalYaw: number; }",
+      "doc": "机体真值(诊断 / 复现用)"
+     },
+     {
+      "kind": "property",
+      "name": "geo",
+      "signature": "geo?: { longitude: number; latitude: number; altitude: number; }",
+      "doc": "相机的地理位置(地理坐标系后端提供;纯局部场景没有这个值)"
      }
     ]
    },
@@ -5804,6 +6558,12 @@ export const API_MODULES: ApiModule[] = [
     "signature": "interface VirtualCaptureProvider { … }",
     "doc": "宿主渲染后端向采集服务暴露的能力。",
     "members": [
+     {
+      "kind": "property",
+      "name": "engine",
+      "signature": "readonly engine?: string",
+      "doc": "后端标识,写进影像元数据"
+     },
      {
       "kind": "method",
       "name": "requestPhoto",
@@ -5815,6 +6575,24 @@ export const API_MODULES: ApiModule[] = [
       "name": "getCaptureCamera",
       "signature": "getCaptureCamera(): CaptureCameraState | null",
       "doc": "取景相机的位姿与内参快照;模型 / 云台未就绪时返回 null"
+     },
+     {
+      "kind": "method",
+      "name": "setCaptureView",
+      "signature": "setCaptureView?(override: CaptureViewOverride | null): void",
+      "doc": "设置取景**俯仰**覆盖(全景分层用);传 `null` 复位。"
+     },
+     {
+      "kind": "method",
+      "name": "spinBodyTo",
+      "signature": "spinBodyTo?(headingDeg: number | null): void",
+      "doc": "让**机体原地自转**到绝对方位角 `headingDeg`(度,罗盘角);`null` 停止自转。"
+     },
+     {
+      "kind": "method",
+      "name": "getBodyHeading",
+      "signature": "getBodyHeading?(): number",
+      "doc": "机体当前方位角(度,罗盘角);没实现的后端返回 undefined"
      }
     ]
    },
@@ -5915,7 +6693,26 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface CaptureServiceOptions { … }",
     "doc": "`CaptureService` 构造选项",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "provider",
+      "signature": "provider?: VirtualCaptureProvider | null",
+      "doc": "虚拟取景帧来源(渲染后端)"
+     },
+     {
+      "kind": "property",
+      "name": "now",
+      "signature": "now?: () => Date",
+      "doc": "时间源,便于测试注入"
+     },
+     {
+      "kind": "property",
+      "name": "createId",
+      "signature": "createId?: () => string",
+      "doc": "id 生成器,便于测试注入"
+     }
+    ]
    },
    {
     "name": "CaptureService",
@@ -5934,6 +6731,12 @@ export const API_MODULES: ApiModule[] = [
       "name": "setProvider",
       "signature": "setProvider(provider: VirtualCaptureProvider | null): void",
       "doc": "换绑定后端(机体切换 / 引擎重建后重新挂)"
+     },
+     {
+      "kind": "method",
+      "name": "getCaptureIntrinsics",
+      "signature": "getCaptureIntrinsics(): CameraIntrinsics | null",
+      "doc": "读取当前取景相机内参(未就绪或后端未提供时返回 null)。"
      },
      {
       "kind": "method",
@@ -5958,12 +6761,6 @@ export const API_MODULES: ApiModule[] = [
       "name": "activeSession",
       "signature": "get activeSession(): CaptureSession | null",
       "doc": "当前会话(最近创建 / 最近操作的那个);面板默认展示它"
-     },
-     {
-      "kind": "method",
-      "name": "getCaptureIntrinsics",
-      "signature": "getCaptureIntrinsics(): CameraIntrinsics | null",
-      "doc": "读取当前取景相机内参(未就绪或后端未提供时返回 null)"
      },
      {
       "kind": "method",
@@ -6084,7 +6881,92 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface DroneCapturePanelOptions { … }",
     "doc": "DroneCapturePanel 构造选项",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "container",
+      "signature": "container?: HTMLElement | null",
+      "doc": "挂载容器;缺省挂到 document.body(此时用 fixed 定位)"
+     },
+     {
+      "kind": "property",
+      "name": "position",
+      "signature": "position?: DroneCapturePanelPosition",
+      "doc": "停靠位置,默认 'bottom-left'(three 页左上/右上/底部中央已被别的面板占用)"
+     },
+     {
+      "kind": "property",
+      "name": "offset",
+      "signature": "offset?: { x?: number; y?: number; }",
+      "doc": "停靠微调(像素)。用 margin 实现,不覆盖 position 的定位规则 —— 演示页里底部左右角已经被 HUD 摇杆占住,面板整体上抬一段就能错开。"
+     },
+     {
+      "kind": "property",
+      "name": "title",
+      "signature": "title?: string",
+      "doc": "面板标题,默认「影像采集」"
+     },
+     {
+      "kind": "property",
+      "name": "injectStyles",
+      "signature": "injectStyles?: boolean",
+      "doc": "是否注入自带样式,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "visible",
+      "signature": "visible?: boolean",
+      "doc": "初始是否可见,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "service",
+      "signature": "service?: CaptureService",
+      "doc": "已有采集服务(多面板共享一个会话列表时传入);缺省按 host 新建一个"
+     },
+     {
+      "kind": "property",
+      "name": "autoCreateSession",
+      "signature": "autoCreateSession?: boolean",
+      "doc": "挂载时若一个会话都没有,是否自动建一个虚拟采集会话,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "sessionDefaults",
+      "signature": "sessionDefaults?: Partial<CaptureSessionOptions>",
+      "doc": "新建会话时套用的默认参数(场景标识 / 地理参考原点 / 自动采集间隔)。 宿主知道自己跑在哪个场景里,把这些填上,采到的影像才带得上场景版本与经纬度。"
+     },
+     {
+      "kind": "property",
+      "name": "downloadOnExport",
+      "signature": "downloadOnExport?: boolean",
+      "doc": "导出时是否顺手触发浏览器下载,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "viewer",
+      "signature": "viewer?: boolean",
+      "doc": "是否启用大图查看器(影像集弹窗点缩略图时打开),默认 true。 弹窗挂在 `document.body` 上(不是面板内部,原因见 drone-image-viewer 模块头), 层级 / 下载按钮 / 翻页回调等细项走 `viewerOptions`。"
+     },
+     {
+      "kind": "property",
+      "name": "viewerOptions",
+      "signature": "viewerOptions?: DroneImageViewerOptions",
+      "doc": "弹窗查看器的细项(层级 / 是否提供下载 / 关闭与翻页回调)"
+     },
+     {
+      "kind": "property",
+      "name": "gallery",
+      "signature": "gallery?: boolean",
+      "doc": "是否启用影像集弹窗(面板上的「打开影像集」按钮),默认 true。 影像的浏览 / 分组 / 一键合成都在它里面(见 drone-gallery);`false` 则面板不提供该入口。"
+     },
+     {
+      "kind": "property",
+      "name": "galleryOptions",
+      "signature": "galleryOptions?: DroneGalleryOptions",
+      "doc": "影像集弹窗的细项(层级 / 合成器 / 关闭与合成回调)"
+     }
+    ]
    },
    {
     "name": "DroneCapturePanel",
@@ -6180,7 +7062,80 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface DroneGalleryOptions { … }",
     "doc": "影像集弹窗构造选项",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "injectStyles",
+      "signature": "injectStyles?: boolean",
+      "doc": "是否注入自带样式,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "zIndex",
+      "signature": "zIndex?: number",
+      "doc": "弹窗层级,默认 900(大图查看器会自动排在它之上)"
+     },
+     {
+      "kind": "property",
+      "name": "title",
+      "signature": "title?: string",
+      "doc": "标题,默认「影像集」"
+     },
+     {
+      "kind": "property",
+      "name": "viewer",
+      "signature": "viewer?: DroneImageViewer | null",
+      "doc": "大图查看器:点缩略图时打开。不传则本弹窗自己建一个(并在销毁时一并卸载); `viewerEnabled: false` 可整块关掉\"点缩略图看大图\"。"
+     },
+     {
+      "kind": "property",
+      "name": "viewerEnabled",
+      "signature": "viewerEnabled?: boolean",
+      "doc": "是否启用\"点缩略图看大图\",默认 true(显式传了 `viewer` 时以传入的为准)"
+     },
+     {
+      "kind": "property",
+      "name": "viewerOptions",
+      "signature": "viewerOptions?: DroneImageViewerOptions",
+      "doc": "建自带查看器时透传的细项"
+     },
+     {
+      "kind": "property",
+      "name": "panoramaViewer",
+      "signature": "panoramaViewer?: DronePanoramaViewer | null",
+      "doc": "全景查看器:点合成结果时打开,**把等距柱状图贴回球面拖动环视**(真机相册的体验)。 不传则本弹窗自己建一个(并在销毁时一并卸载);`panoramaViewerEnabled: false` 关掉它 (那时合成结果仍可下载,只是不再有球面浏览)。"
+     },
+     {
+      "kind": "property",
+      "name": "panoramaViewerEnabled",
+      "signature": "panoramaViewerEnabled?: boolean",
+      "doc": "是否启用球面全景查看,默认 true(显式传了 `panoramaViewer` 时以传入的为准)"
+     },
+     {
+      "kind": "property",
+      "name": "panoramaViewerOptions",
+      "signature": "panoramaViewerOptions?: DronePanoramaViewerOptions",
+      "doc": "建自带全景查看器时透传的细项"
+     },
+     {
+      "kind": "property",
+      "name": "stitcher",
+      "signature": "stitcher?: PanoramaStitcher | null",
+      "doc": "合成器。「一键合成」用它把一组全景照片拼成一张图; 不传 = 库内自带的等距柱状拼接(见 drone-stitch);传 `null` = 关掉合成按钮。"
+     },
+     {
+      "kind": "property",
+      "name": "onClose",
+      "signature": "onClose?: () => void",
+      "doc": "关闭回调(点 × / 点遮罩 / Esc)"
+     },
+     {
+      "kind": "property",
+      "name": "onStitched",
+      "signature": "onStitched?: (group: ImageGroup, result: PanoramaStitchResult | null) => void",
+      "doc": "某组合成结束的回调(失败时 result 为 null)"
+     }
+    ]
    },
    {
     "name": "DroneGallery",
@@ -6275,6 +7230,13 @@ export const API_MODULES: ApiModule[] = [
     "members": []
    },
    {
+    "name": "createOriginalImagesZip",
+    "kind": "function",
+    "signature": "function createOriginalImagesZip(images: CapturedImage[]): Promise<Blob>",
+    "doc": "将会话里的原始照片打包为不压缩 ZIP,避免重复压缩 JPEG/PNG 并控制额外内存占用。",
+    "members": []
+   },
+   {
     "name": "VALIDATION_LABELS",
     "kind": "const",
     "signature": "const VALIDATION_LABELS: Record<CapturedImage['validation']['status'], string>",
@@ -6321,6 +7283,12 @@ export const API_MODULES: ApiModule[] = [
      },
      {
       "kind": "property",
+      "name": "mode",
+      "signature": "mode?: string",
+      "doc": "全景模式标识(`pano-wide` / `pano-180` / `pano-360`);单张组为 undefined"
+     },
+     {
+      "kind": "property",
       "name": "images",
       "signature": "images: CapturedImage[]",
       "doc": "组内影像(已按组内序号排序)"
@@ -6336,6 +7304,12 @@ export const API_MODULES: ApiModule[] = [
       "name": "complete",
       "signature": "complete: boolean",
       "doc": "该组是否已拍满(张数达到预设总张数);单张组恒为 false"
+     },
+     {
+      "kind": "property",
+      "name": "total",
+      "signature": "total?: number",
+      "doc": "预设总张数(全景组才有)"
      }
     ]
    },
@@ -6381,7 +7355,38 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface DroneImageViewerOptions { … }",
     "doc": "弹窗查看器构造选项",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "injectStyles",
+      "signature": "injectStyles?: boolean",
+      "doc": "是否注入自带样式,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "zIndex",
+      "signature": "zIndex?: number",
+      "doc": "弹窗层级,默认 1000(库内面板最高 21,留足余量)"
+     },
+     {
+      "kind": "property",
+      "name": "downloadable",
+      "signature": "downloadable?: boolean",
+      "doc": "是否提供「下载原图」按钮,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "onClose",
+      "signature": "onClose?: () => void",
+      "doc": "关闭回调(点 × / 点空白 / Esc 都会触发)"
+     },
+     {
+      "kind": "property",
+      "name": "onNavigate",
+      "signature": "onNavigate?: (image: CapturedImage, index: number) => void",
+      "doc": "翻页回调 —— 便于宿主把外部状态(如面板选中态)跟着同步"
+     }
+    ]
    },
    {
     "name": "DroneImageViewer",
@@ -6459,13 +7464,74 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface DronePanoramaViewerOptions { … }",
     "doc": "全景查看器构造选项",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "injectStyles",
+      "signature": "injectStyles?: boolean",
+      "doc": "是否注入自带样式,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "zIndex",
+      "signature": "zIndex?: number",
+      "doc": "弹窗层级,默认 1100(排在影像集弹窗之上)"
+     },
+     {
+      "kind": "property",
+      "name": "initialYawDeg",
+      "signature": "initialYawDeg?: number",
+      "doc": "初始朝向(方位角,度),默认 0 = 输出图正中(即该组的起始航向)"
+     },
+     {
+      "kind": "property",
+      "name": "initialPitchDeg",
+      "signature": "initialPitchDeg?: number",
+      "doc": "初始仰角(度),默认 0 = 平视"
+     },
+     {
+      "kind": "property",
+      "name": "initialFovDeg",
+      "signature": "initialFovDeg?: number",
+      "doc": "初始垂直视野角(度),默认 75"
+     },
+     {
+      "kind": "property",
+      "name": "minFovDeg",
+      "signature": "minFovDeg?: number",
+      "doc": "垂直视野角上下限,默认 25 ~ 110"
+     },
+     {
+      "kind": "property",
+      "name": "maxFovDeg",
+      "signature": "maxFovDeg?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "downloadable",
+      "signature": "downloadable?: boolean",
+      "doc": "是否提供「下载原图」按钮,默认 true"
+     },
+     {
+      "kind": "property",
+      "name": "importable",
+      "signature": "importable?: boolean",
+      "doc": "是否提供「导入图片」按钮(从本地选一张等距柱状全景图看球面),默认 false。 影像集弹窗里已有自己的入口,那里不需要;独立打开的查看器(比如 demo 页的按钮)开着才方便。"
+     },
+     {
+      "kind": "property",
+      "name": "onClose",
+      "signature": "onClose?: () => void",
+      "doc": "关闭回调(点 × / 点遮罩 / Esc)"
+     }
+    ]
    },
    {
     "name": "DronePanoramaViewer",
     "kind": "class",
     "signature": "declare class DronePanoramaViewer { … }",
-    "doc": "球面全景查看器:一张等距柱状全景图 + 可拖动环视的球面。",
+    "doc": "全景查看器:一张带有球面投影范围的等距柱状图 + 可拖动环视的球面局部或整球。",
     "members": [
      {
       "kind": "method",
@@ -6524,7 +7590,7 @@ export const API_MODULES: ApiModule[] = [
   "file": "drone-panorama",
   "title": "PanoramaCapture · 全景拍摄",
   "group": "影像采集层",
-  "doc": "全景拍摄(广角 / 180° / 球形 360°)—— 大疆式网格扫描。",
+  "doc": "全景拍摄(180° / 360°)—— 大疆式网格扫描。",
   "items": [
    {
     "name": "PanoramaMode",
@@ -6643,7 +7709,7 @@ export const API_MODULES: ApiModule[] = [
     "name": "PANORAMA_PRESETS",
     "kind": "const",
     "signature": "const PANORAMA_PRESETS: Record<PanoramaMode, PanoramaPreset>",
-    "doc": "广角采用 3×3 网格(9 张);180° 采用 7×3 网格(21 张);球形 360° 采用 8 个方位,俯仰层距按相机垂直视场计算并补天顶、天底,张数随视场变化。",
+    "doc": "广角采用 3×3 网格(9 张);180° 采用 7×3 网格(21 张); 球形 360° 采用 8 个方位;俯仰层数按相机实际垂直视场自动计算,并补天顶/天底。",
     "members": []
    },
    {
@@ -6719,6 +7785,12 @@ export const API_MODULES: ApiModule[] = [
       "name": "group",
       "signature": "group: string | null",
       "doc": "组 id(开始拍摄后才有)"
+     },
+     {
+      "kind": "property",
+      "name": "message",
+      "signature": "message?: string",
+      "doc": ""
      }
     ]
    },
@@ -6759,26 +7831,62 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface PanoramaStitchResult { … }",
     "doc": "拼接产物(库里只搬运,不解释)",
-     "members": [
-      {
-       "kind": "property",
-       "name": "diagnosticUrl",
-       "signature": "diagnosticUrl?: string",
-       "doc": "可选的覆盖热力图:红=无照片覆盖,黄=单张覆盖,绿=多张重叠"
-      },
-      {
-       "kind": "property",
-       "name": "diagnosticCoverage",
-       "signature": "diagnosticCoverage?: { uncovered: number; single: number; overlap: number }",
-       "doc": "覆盖热力图像素占比:未覆盖、仅单张覆盖、至少两张照片重叠"
-      },
-      {
-       "kind": "property",
-       "name": "equirectangular",
-       "signature": "equirectangular?: { thetaStart: number; spanTheta: number; phiTop: number; spanPhi: number; wrapsTheta: boolean }",
-       "doc": "等距柱状局部投影范围;提供时环视器按该范围映射,省略时按整球解释"
-      }
-     ]
+    "members": [
+     {
+      "kind": "property",
+      "name": "url",
+      "signature": "url?: string",
+      "doc": "可直接显示的地址(blob: / http: / data:);以字符串打开时按标准整球解释"
+     },
+     {
+      "kind": "property",
+      "name": "diagnosticUrl",
+      "signature": "diagnosticUrl?: string",
+      "doc": "可选的覆盖热力图:红=无照片覆盖,黄=单张覆盖,绿=多张重叠"
+     },
+     {
+      "kind": "property",
+      "name": "diagnosticCoverage",
+      "signature": "diagnosticCoverage?: { uncovered: number; single: number; overlap: number; }",
+      "doc": "覆盖热力图像素占比;未覆盖区域必须由拼接器补边,存在视差风险区域通常只被一张照片覆盖"
+     },
+     {
+      "kind": "property",
+      "name": "blob",
+      "signature": "blob?: Blob",
+      "doc": "也可以直接给二进制,由宿主决定怎么用"
+     },
+     {
+      "kind": "property",
+      "name": "width",
+      "signature": "width?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "height",
+      "signature": "height?: number",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "name",
+      "signature": "name?: string",
+      "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "coverage",
+      "signature": "coverage?: number",
+      "doc": "有效覆盖比例(0~1) —— 拼接后画面里\"真的有像素\"的部分占比。 库内自带拼接器(见 drone-stitch)会填;宿主自己的拼接器可以不填。 拿它判断\"这组是不是拍漏了\"(比如中途没转到位,角落空一块)。"
+     },
+     {
+      "kind": "property",
+      "name": "equirectangular",
+      "signature": "equirectangular?: { thetaStart: number; spanTheta: number; phiTop: number; spanPhi: number; wrapsTheta: boolean; }",
+      "doc": "局部全景带的球面范围;缺省表示标准 360°×180° 整球。"
+     }
+    ]
    },
    {
     "name": "PanoramaStitcher",
@@ -6829,6 +7937,18 @@ export const API_MODULES: ApiModule[] = [
       "name": "cancelled",
       "signature": "cancelled: boolean",
       "doc": ""
+     },
+     {
+      "kind": "property",
+      "name": "error",
+      "signature": "error?: string",
+      "doc": "没能完成的原因(机体没起飞 / 后端不支持自转 / 机身转不到位),成功时为 undefined"
+     },
+     {
+      "kind": "property",
+      "name": "stitched",
+      "signature": "stitched?: PanoramaStitchResult | null",
+      "doc": "拼接产物(注入过拼接器且未取消时才有)"
      }
     ]
    },
@@ -6837,6 +7957,38 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface PanoramaCaptureOptions { … }",
     "doc": "`PanoramaCapture` 构造选项",
+    "members": [
+     {
+      "kind": "property",
+      "name": "shotIntervalMs",
+      "signature": "shotIntervalMs?: number",
+      "doc": "每张之间的间隔(毫秒),默认 0(拍完立即转下一个方位)。 想更贴近真机节奏、或给渲染后端留稳定时间时调大(真机每张约 0.5~1s)。"
+     },
+     {
+      "kind": "property",
+      "name": "spinTimeoutMs",
+      "signature": "spinTimeoutMs?: number",
+      "doc": "等待机身转到位的最长时间(毫秒),默认 8000。 超时即判定\"转不过去\"(没起飞、正在返航、速度倍率为 0),以失败收尾而不是硬拍。"
+     },
+     {
+      "kind": "property",
+      "name": "stitcher",
+      "signature": "stitcher?: PanoramaStitcher | null",
+      "doc": "拼接器(可选)"
+     },
+     {
+      "kind": "property",
+      "name": "onStitched",
+      "signature": "onStitched?: (result: PanoramaStitchResult | null, group: PanoramaGroup) => void",
+      "doc": "整组拍完并完成拼接后的回调(宿主落盘 / 提示用)"
+     }
+    ]
+   },
+   {
+    "name": "sphericalPitchGrid",
+    "kind": "function",
+    "signature": "function sphericalPitchGrid(verticalFovDeg: number): number[]",
+    "doc": "根据相机垂直 FOV 生成覆盖两极的俯仰层,相邻层中心距不超过 FOV 的 60%。",
     "members": []
    },
    {
@@ -6878,7 +8030,7 @@ export const API_MODULES: ApiModule[] = [
      {
       "kind": "method",
       "name": "preset",
-      "signature": "static preset(mode: PanoramaMode): PanoramaPreset",
+      "signature": "static preset(mode: PanoramaMode, verticalFovDeg?: number): PanoramaPreset",
       "doc": "取预设(UI 展示行列数 / 张数用)"
      },
      {
@@ -6929,7 +8081,62 @@ export const API_MODULES: ApiModule[] = [
     "kind": "interface",
     "signature": "interface EquirectStitcherOptions { … }",
     "doc": "`EquirectStitcher` 构造选项",
-    "members": []
+    "members": [
+     {
+      "kind": "property",
+      "name": "pixelsPerDegree",
+      "signature": "pixelsPerDegree?: number",
+      "doc": "输出分辨率(每度像素数),默认 10。整球输出即 3600×1800。 越大越清晰、越慢(耗时与输出像素数 × 影像数成正比)。"
+     },
+     {
+      "kind": "property",
+      "name": "maxWidth",
+      "signature": "maxWidth?: number",
+      "doc": "输出宽度上限(像素),默认 4096;超出按比例整体缩小"
+     },
+     {
+      "kind": "property",
+      "name": "maxHeight",
+      "signature": "maxHeight?: number",
+      "doc": "输出高度上限(像素),默认 2048"
+     },
+     {
+      "kind": "property",
+      "name": "projection",
+      "signature": "projection?: EquirectProjection",
+      "doc": "输出投影,默认按全景模式自动选择(`pano-360` 用 sphere,广角/180° 用 band): - `'sphere'`:整颗球的标准等距柱状图(360°×180°、2:1 长条,与 DJI 全景同规格), 没拍到的天顶 / 天底 / 方位缺口按 `fill` 补上,输出是规整矩形;"
+     },
+     {
+      "kind": "property",
+      "name": "fill",
+      "signature": "fill?: EquirectFill",
+      "doc": "球面输出时未覆盖区域的填充方式,默认 `'edge'`: - `'edge'`:**先横向后纵向**补 —— 每行先横向接续(两侧月牙被同行最近的天空/地面 内容接上),再向天顶 / 天底铺该列的边缘颜色,与真机球面全景的观感一致;"
+     },
+     {
+      "kind": "property",
+      "name": "feather",
+      "signature": "feather?: number",
+      "doc": "羽化带宽(占半幅比例,0~0.9),默认 0.22"
+     },
+     {
+      "kind": "property",
+      "name": "background",
+      "signature": "background?: string | null",
+      "doc": "未覆盖区域的底色;不给 = 保持透明(需要 PNG)"
+     },
+     {
+      "kind": "property",
+      "name": "mimeType",
+      "signature": "mimeType?: string",
+      "doc": "输出 MIME,默认 `image/png`(透明角落需要 PNG);用 `image/jpeg` 时请同时给 `background`"
+     },
+     {
+      "kind": "property",
+      "name": "quality",
+      "signature": "quality?: number",
+      "doc": "JPEG 质量(0~1),默认 0.9"
+     }
+    ]
    },
    {
     "name": "EquirectStitcher",
@@ -6962,6 +8169,13 @@ export const API_MODULES: ApiModule[] = [
     "kind": "function",
     "signature": "function createEquirectStitcher(options?: EquirectStitcherOptions): EquirectStitcher",
     "doc": "建一个默认参数的等距柱状拼接器(库内默认注入给影像集弹窗的\"一键合成\")",
+    "members": []
+   },
+   {
+    "name": "angularExtent",
+    "kind": "function",
+    "signature": "function angularExtent(centerTheta: number, centerPhi: number, right: [number, number, number], up: [number, number, number], forward: [number, number, number], tanH: number, tanV: number): { halfTheta: number; halfPhi: number; }",
+    "doc": "实测该张在方位 / 仰角上的覆盖半宽。",
     "members": []
    }
   ]

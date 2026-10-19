@@ -28,6 +28,12 @@ const router = createRouter({
       component: () => import('../views/api-docs/api-docs-view.vue'),
       meta: { title: 'API 参考', menu: true },
     },
+    {
+      path: '/class-map',
+      name: 'ClassMap',
+      component: () => import('../views/class-map/class-map.vue'),
+      meta: { title: '类与方法', menu: true },
+    },
   ],
 })
 

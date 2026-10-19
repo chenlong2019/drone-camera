@@ -67,11 +67,21 @@ export class DemoScenery {
 
     // 摆放顺序:先定跑道/停机坪与地标(占位)→ 再铺城市 → 再种树 → 最后远山。
     // 后面的每一类都回避前面已占的区域,于是不会出现"楼长在跑道上""树穿过楼"。
+    this.buildCityGround()
     this.buildGroundMarkings()
     this.buildLandmarks()
     this.buildCity()
     this.buildForest()
     this.buildHills()
+
+    // 阴影统一开关:逐个 mesh 记容易漏(漏一个,影子就断一截),traverse 一遍全覆盖。
+    // 城市地面/建筑/树/地标全部参与投影与接收,清晨低角度长影才完整。
+    this.group.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.castShadow = true
+        obj.receiveShadow = true
+      }
+    })
 
     scene.add(this.group)
   }
@@ -270,6 +280,30 @@ export class DemoScenery {
    * 地面层:起飞坪 + 跑道 + 两条十字道路。
    * 全部抬到 y≈0.03,躲开库的底板(y=-0.012)与米级网格(y=0)的同面闪烁。
    */
+  /**
+   * 城市地面:一块半径 170m 的暖深灰盘,盖住库沙盒的近黑底板(0x0a1216)与网格。
+   * 为什么必须盖:沙盒底板是「赛博黑 + 青网格」,与写实城市/真实天空是两套语言,
+   * 同框时观众立刻出戏;地面接收 HDRI 天空光的暖色反弹,画面下半部才不再是死黑。
+   * y=0.008:盖过细网格(0)/粗网格(0.004),让位给停机坪(0.03)与跑道。
+   */
+  private buildCityGround(): void {
+    const geo = this.keep(new THREE.CircleGeometry(170, 72))
+    const mat = this.keep(
+      new THREE.MeshStandardMaterial({
+        color: 0x2a2d28,
+        roughness: 0.96,
+        metalness: 0.0,
+      }),
+    )
+    const ground = new THREE.Mesh(geo, mat)
+    ground.rotation.x = -Math.PI / 2
+    ground.position.y = 0.008
+    ground.receiveShadow = true
+    ground.name = 'SCENERY_CITY_GROUND'
+    this.group.add(ground)
+    this.counts.props += 1
+  }
+
   private buildGroundMarkings(): void {
     // 起飞坪——就压在起飞点(原点)上,舱内/地面视角拍全景时脚下有内容
     const padRadius = 6.5

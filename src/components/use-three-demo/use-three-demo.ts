@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js'
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
 import {
   CaptureService,
@@ -19,6 +20,26 @@ import { DemoScenery } from './demo-scenery'
 
 /** 真机 GLB 路径(需自行放到 public/models 下);不给这个 URL 即用库内置哈士奇机体 */
 const GLB_MODEL_URL = '/models/dji_mini4_pro.glb'
+
+/**
+ * 户外 HDRI 环境图(Poly Haven,CC0)。清晨低角度太阳,暖色直射 + 冷色天空漫射,
+ * 一次性给出真实场景缺的三件事:天空背景、天空漫射光、地面反弹光。
+ *
+ * 为什么不用 RoomEnvironment:那是「白色影棚」,给金属机体做中性反射是对的,
+ * 但户外场景的天空方向、色温、地平线全是假的,材质再对也像塑料。这里只在加载失败时兜底。
+ * `?hdri=0` 可退回旧的中性环境,便于对比。
+ */
+const HDRI_URL = '/hdri/spruit_sunrise_4k.hdr'
+
+/**
+ * 太阳方位:由 HDRI 最亮区域实测反推(tmp-shots/find-sun-page.mjs)——
+ * 方位角 36.6° / 仰角 8.4°,清晨低角度太阳。
+ *
+ * ⚠️ 方向光的方位必须与背景天空里的太阳严格一致:阴影方向和天空光是观众
+ * 无意识校对的两件事,一旦矛盾就是最典型的「一眼假」。
+ * 仰角只有 8.4°,阴影会拉到楼高的 6~7 倍 —— 这正是黄金时刻的视觉特征。
+ */
+const SUN_POSITION = { x: 80, y: 15, z: 59 }
 
 /**
  * 泛光(bloom)参数 —— 「灯光透亮感」的来源:过曝亮核在屏幕上溢出柔和光晕。
@@ -47,6 +68,10 @@ export class UseThreeDemo {
   private bloomPass: ReturnType<typeof bloom> | null = null
   private controls: OrbitControls | null = null
   private animateId: number | null = null
+  /** 太阳方向光(阴影来源)。方位需与 HDRI 里的太阳一致,见 applyHdriEnvironment */
+  private dirLight: THREE.DirectionalLight | null = null
+  /** HDRI 贴图(同时用作背景与环境光),销毁时要显式释放 */
+  private hdriTexture: THREE.Texture | null = null
   /**
    * demo 侧的布景层(城市 / 自然 / 标线 / 地标)—— 纯 three,不进库。
    * 见 demo-scenery.ts:它只往场景里加可看的东西,并把建筑/地标的 AABB 交给 demo 写进 sim.obstacles。
@@ -119,6 +144,7 @@ export class UseThreeDemo {
     this.renderer = new WebGPURenderer({ antialias: true })
     await this.renderer.init()
     this.renderer.setSize(width, height)
+    this.renderer.shadowMap.enabled = true
     this.container.appendChild(this.renderer.domElement)
 
     // 轨道控制器
@@ -126,22 +152,32 @@ export class UseThreeDemo {
     this.controls.enableDamping = true
     this.controls.dampingFactor = 0.05
 
-    // 灯光
-    const dirLight = new THREE.DirectionalLight(0xffffff, 1)
-    dirLight.position.set(3, 5, 4)
+    // —— 灯光:方向光负责「太阳锐影」,天空漫射全部交给 HDRI ——
+    // 不再用 AmbientLight:它与 HDRI 的天空漫射重复,会把阴影洗灰、对比度塌陷。
+    // 色温取清晨暖阳;强度给足,因为 PMREM 里的太阳只是模糊亮斑,锐影全靠这盏灯。
+    const dirLight = new THREE.DirectionalLight(0xffd2a0, 3.0)
+    dirLight.position.set(SUN_POSITION.x, SUN_POSITION.y, SUN_POSITION.z)
+    dirLight.castShadow = true
+    dirLight.shadow.mapSize.set(2048, 2048)
+    dirLight.shadow.camera.near = 10
+    dirLight.shadow.camera.far = 500
+    dirLight.shadow.camera.left = -220
+    dirLight.shadow.camera.right = 220
+    dirLight.shadow.camera.top = 220
+    dirLight.shadow.camera.bottom = -220
+    // 改过正交范围必须重算投影矩阵,否则仍按默认 ±5m 裁剪 —— 表现为「只有原点附近有影子」
+    dirLight.shadow.camera.updateProjectionMatrix()
+    dirLight.shadow.bias = -0.0005
     this.scene.add(dirLight)
-    const ambientLight = new THREE.AmbientLight(0x404040)
-    this.scene.add(ambientLight)
-    // 环境贴图:哈士奇机体大量 metalness 0.7~0.9 的金属材质,没有环境光反射会发黑;
-    // RoomEnvironment 给所有 PBR 机体(哈士奇 / 真机 GLB)提供中性反射底光
-    const pmrem = new PMREMGenerator(this.renderer)
-    const room = new RoomEnvironment()
-    this.scene.environment = pmrem.fromScene(room, 0.04).texture
-    this.scene.environmentIntensity = 0.55
-    room.dispose()
-    pmrem.dispose()
+    this.dirLight = dirLight
+
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping
     this.renderer.toneMappingExposure = 1.0
+
+    // 先给中性影棚底光,保证首帧金属机体就有正确反射;
+    // 再异步升级到真实户外 HDRI(24MB,不阻塞首帧,加载完自动替换)。
+    this.applyFallbackEnvironment()
+    void this.applyHdriEnvironment()
 
     // 后期管线:场景色 + 泛光。pass 渲到 HDR 线性缓冲(材质级 toneMapped 标志在 RT 路径下不生效,
     // ACES 改由输出级统一做)—— LED 亮核(core 增益后线性 >1)溢出光晕,白色壳体(<threshold)不受影响。
@@ -166,6 +202,60 @@ export class UseThreeDemo {
 
     window.addEventListener('resize', this.onResize.bind(this))
     this.animate()
+  }
+
+  /**
+   * 中性影棚环境 —— 兜底。
+   * 哈士奇机体有大量 metalness 0.7~0.9 的金属件,没有环境反射会发黑,
+   * 所以 HDRI 未就绪(或失败)时先用 RoomEnvironment 顶住,保证首帧不是黑飞机。
+   */
+  private applyFallbackEnvironment(): void {
+    const scene = this.scene
+    const renderer = this.renderer
+    if (!scene || !renderer) return
+    const pmrem = new PMREMGenerator(renderer)
+    const room = new RoomEnvironment()
+    scene.environment = pmrem.fromScene(room, 0.04).texture
+    // 没有替代 AmbientLight,由环境图独立承担漫射,故比原先的 0.55 提高
+    scene.environmentIntensity = 0.9
+    room.dispose()
+    pmrem.dispose()
+  }
+
+  /**
+   * 载入真实户外 HDRI(Poly Haven, CC0)。
+   *
+   * 一张图同时解决三件事,这也是它比调参数更有效的原因:
+   *   1) 背景 —— 天空有渐变、有云、有地平线,不再是纯色色块;
+   *   2) 环境漫射 —— 天空光从上方来、地面反弹从下方来,方向性正确;
+   *   3) 材质反射 —— 玻璃/金属反射的是真实天空而不是白墙。
+   *
+   * 加载期间场景可能被销毁(切路由/destroy),此时丢弃贴图,避免泄漏。
+   * `?hdri=0` 保留旧的影棚环境,便于 A/B 对比。
+   */
+  private async applyHdriEnvironment(): Promise<void> {
+    const scene = this.scene
+    if (!scene) return
+    if (new URLSearchParams(window.location.search).get('hdri') === '0') return
+    try {
+      const tex = await new RGBELoader().loadAsync(HDRI_URL)
+      if (this.scene !== scene) {
+        tex.dispose()
+        return
+      }
+      tex.mapping = THREE.EquirectangularReflectionMapping
+      scene.environment = tex
+      // 压一点环境:0.85 留出阴影对比度;给满 1.0 时天空漫射会把长影洗灰
+      scene.environmentIntensity = 0.85
+      scene.background = tex
+      scene.backgroundIntensity = 1
+      // 雾色取 HDRI 地平线的暖灰:远景没入大气而不是被生硬切断。
+      // 只在 HDRI 生效时加 —— 影棚兜底场景加雾反而怪。
+      scene.fog = new THREE.FogExp2(0xc9b8a3, 0.0009)
+      this.hdriTexture = tex
+    } catch {
+      // 保持 RoomEnvironment 兜底,静默失败:天空贴图不该阻断整个 demo
+    }
   }
 
   /** 机型来源:不传 url = 用库内置的哈士奇机体(见 DroneFly.initialize) */
@@ -388,6 +478,10 @@ export class UseThreeDemo {
 
     this.postProcessing = null
     this.bloomPass = null
+
+    this.hdriTexture?.dispose()
+    this.hdriTexture = null
+    this.dirLight = null
 
     if (this.renderer) {
       this.renderer.dispose()

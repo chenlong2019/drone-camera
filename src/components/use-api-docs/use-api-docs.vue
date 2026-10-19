@@ -23,6 +23,7 @@
         </template>
         <div class="api-nav-actions">
           <button type="button" class="api-nav-btn" @click="goDocs">← 使用文档</button>
+          <button type="button" class="api-nav-btn" @click="goClassMap">类与方法</button>
           <button type="button" class="api-nav-btn" @click="goDemo">进入演示 →</button>
         </div>
       </div>
@@ -241,6 +242,10 @@ function goDocs(): void {
 }
 function goDemo(): void {
   void router.push('/three-demo')
+}
+
+function goClassMap(): void {
+  void router.push('/class-map')
 }
 
 onMounted(() => {
