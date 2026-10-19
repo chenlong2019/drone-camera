@@ -34,6 +34,23 @@ Copy-Item '.\validation-report.json' "$capture\validation-report.json"
 
 如果 ZIP 解压后多了一层 `images\images`，把内层文件移到 `capture-directory\images`。不要改文件名或手动修改 manifest。
 
+上面的命令是 Windows PowerShell。如果使用 `cmd.exe`，可以这样执行：
+
+```bat
+set "CAPTURE=D:\photogrammetry\capture-20261019"
+mkdir "%CAPTURE%\images"
+powershell.exe -NoProfile -Command "Expand-Archive -LiteralPath '.\images.zip' -DestinationPath '%CAPTURE%\images' -Force"
+copy /Y manifest.json "%CAPTURE%\manifest.json"
+copy /Y validation-report.json "%CAPTURE%\validation-report.json"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run-colmap-reconstruction.ps1" -CaptureDir "%CAPTURE%" -OutputDir "%CAPTURE%\reconstruction"
+```
+
+如果 `colmap.exe` 没有加入 PATH，在最后一条命令追加：
+
+```bat
+-ColmapExe "C:\Program Files\COLMAP\bin\colmap.exe"
+```
+
 ## 2. 运行 COLMAP
 
 安装 COLMAP，并确认命令行可用：
