@@ -100,7 +100,7 @@ reconstruction/
   reconstruction-report.json
 ```
 
-脚本默认关闭 CUDA SIFT，便于在没有 NVIDIA GPU 的机器上运行；有 GPU 时可以传 `-UseGpu`。影像少于三张、注册图像数过低或 COLMAP 阶段失败时，脚本会停止并保留日志。
+脚本会根据已安装的 COLMAP 版本探测 SIFT 的 GPU 参数；支持该参数的版本可传 `-UseGpu`，不支持的新版会使用自身默认加速模式。影像少于三张、注册图像数过低或 COLMAP 阶段失败时，脚本会停止并保留日志。
 
 ## 3. 检查重建结果
 

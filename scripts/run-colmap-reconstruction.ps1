@@ -59,7 +59,6 @@ $sparse = Join-Path $output 'sparse'
 $dense = Join-Path $output 'dense'
 $mesh = Join-Path $output 'mesh'
 $reportPath = Join-Path $output 'reconstruction-report.json'
-$gpuFlag = if ($UseGpu) { '1' } else { '0' }
 $invariant = [Globalization.CultureInfo]::InvariantCulture
 $cameraParams = @($camera.fx, $camera.fy, $camera.cx, $camera.cy) | ForEach-Object {
   ([double]$_).ToString('R', $invariant)
@@ -75,13 +74,35 @@ function Invoke-Colmap([string[]]$Arguments, [string]$Stage) {
   if ($LASTEXITCODE -ne 0) { throw "COLMAP stage failed ($Stage), exit code $LASTEXITCODE" }
 }
 
+function Find-Option([string]$Command, [string[]]$Candidates) {
+  # COLMAP changed the SIFT GPU option names across releases. Resolve the
+  # option from this installation instead of making one version-specific flag
+  # mandatory for every run.
+  $help = (& $ColmapExe $Command '-h' 2>&1 | Out-String)
+  foreach ($candidate in $Candidates) {
+    if ($help -match [regex]::Escape($candidate)) { return $candidate }
+  }
+  return $null
+}
+
+$featureGpuOption = Find-Option 'feature_extractor' @('--SiftExtraction.use_gpu', '--FeatureExtraction.use_gpu')
+$matchingGpuOption = Find-Option 'exhaustive_matcher' @('--SiftMatching.use_gpu', '--FeatureMatching.use_gpu')
+if ($UseGpu -and $null -eq $featureGpuOption -and $null -eq $matchingGpuOption) {
+  Write-Warning 'This COLMAP version does not expose SIFT GPU switches; COLMAP will choose its default acceleration mode.'
+}
+$featureGpuArgs = if ($null -ne $featureGpuOption) { @($featureGpuOption, $(if ($UseGpu) { '1' } else { '0' })) } else { @() }
+$matchingGpuArgs = if ($null -ne $matchingGpuOption) { @($matchingGpuOption, $(if ($UseGpu) { '1' } else { '0' })) } else { @() }
+
 try {
-  Invoke-Colmap @(
+  $featureArguments = @(
     'feature_extractor', '--database_path', $database, '--image_path', $images,
     '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'PINHOLE',
-    '--ImageReader.camera_params', $cameraParams, '--SiftExtraction.use_gpu', $gpuFlag
-  ) 'feature-extraction'
-  Invoke-Colmap @('exhaustive_matcher', '--database_path', $database, '--SiftMatching.use_gpu', $gpuFlag) 'matching'
+    '--ImageReader.camera_params', $cameraParams
+  ) + $featureGpuArgs
+  Invoke-Colmap $featureArguments 'feature-extraction'
+
+  $matchingArguments = @('exhaustive_matcher', '--database_path', $database) + $matchingGpuArgs
+  Invoke-Colmap $matchingArguments 'matching'
 
   $null = New-Item -ItemType Directory -Force -Path $sparse
   Invoke-Colmap @('mapper', '--database_path', $database, '--image_path', $images, '--output_path', $sparse) 'sfm'
