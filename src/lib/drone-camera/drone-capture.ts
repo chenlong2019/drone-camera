@@ -26,6 +26,17 @@
  */
 import { readJpegExif } from './drone-exif'
 import type { ExifData } from './drone-exif'
+import {
+  buildCaptureManifest,
+  serializeCaptureManifest,
+  validateCaptureManifest,
+} from './drone-capture-manifest'
+import type {
+  CaptureManifest,
+  CaptureManifestOptions,
+  CaptureValidationReport,
+  CaptureValidatorOptions,
+} from './drone-capture-manifest'
 
 /** 影像来源:场景渲染图 / 真实相机照片 */
 export type ImageSource = 'virtual-camera' | 'real-camera'
@@ -207,6 +218,8 @@ export interface VirtualShot {
   dataUrl: string
   width: number
   height: number
+  /** 可选的同一渲染帧相机快照。渲染后端应优先提供它。 */
+  camera?: CaptureCameraState
 }
 
 /**
@@ -280,7 +293,7 @@ export interface CaptureSessionSummary {
 }
 
 /** 导出格式 */
-export type CaptureExportFormat = 'json' | 'csv'
+export type CaptureExportFormat = 'json' | 'csv' | 'manifest'
 
 /** 会话导出文件标识 */
 export const CAPTURE_EXPORT_FORMAT = 'drone-camera/capture-session'
@@ -464,6 +477,27 @@ export class CaptureService {
     return intrinsics ? { ...intrinsics } : null
   }
 
+  /** 将浏览器会话转换为可交给离线重建任务的 CaptureManifest。 */
+  buildManifest(sessionId: string, options: CaptureManifestOptions = {}): CaptureManifest | null {
+    const session = this.sessions.get(sessionId)
+    return session ? buildCaptureManifest(session, options) : null
+  }
+
+  /** 导出文档约定的 manifest.json 文本。影像二进制仍由宿主按 file/imageUrl 落盘。 */
+  exportManifest(sessionId: string, options: CaptureManifestOptions = {}, space = 2): string {
+    const manifest = this.buildManifest(sessionId, options)
+    return manifest ? serializeCaptureManifest(manifest, space) : ''
+  }
+
+  /** 在提交离线重建前运行 Manifest 质量门禁。 */
+  validateSession(
+    sessionId: string,
+    options: CaptureManifestOptions & CaptureValidatorOptions = {},
+  ): CaptureValidationReport | null {
+    const manifest = this.buildManifest(sessionId, options)
+    return manifest ? validateCaptureManifest(manifest, options) : null
+  }
+
   // ───────────────────────────── 会话 ─────────────────────────────
 
   /** 新建拍摄会话(指定覆盖俯仰/张数等,返回会话) */
@@ -606,7 +640,8 @@ export class CaptureService {
       const shot = await provider.requestPhoto()
       if (!shot) return null
       // 成片到手后再读相机状态(那一刻仍是取景帧的仿真状态,含本次的俯仰覆盖)
-      const camera = provider.getCaptureCamera()
+      // 渲染后端若锁存了同帧状态，优先使用它，避免 await 后读取到下一帧。
+      const camera = shot.camera ?? provider.getCaptureCamera()
       const image = this.buildVirtualImage(session, shot, camera, options.panorama)
       session.images.push(image)
       if (session.status === 'created') session.status = 'capturing'
@@ -824,6 +859,7 @@ export class CaptureService {
   exportSession(sessionId: string, format: CaptureExportFormat = 'json'): string {
     const session = this.sessions.get(sessionId)
     if (!session) return format === 'csv' ? '' : '{}'
+    if (format === 'manifest') return this.exportManifest(sessionId)
     return format === 'csv' ? this.toCsv(session) : this.toJson(session)
   }
 

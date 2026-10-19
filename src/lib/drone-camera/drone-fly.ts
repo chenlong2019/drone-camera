@@ -171,6 +171,8 @@ export interface PhotoShot {
   dataUrl: string
   width: number
   height: number
+  /** 与该 PNG 同一渲染帧的取景相机快照。 */
+  camera?: CaptureCameraState
 }
 
 /** 相机位姿快照:取景帧(拍照 / 录像)渲染完必须还回去 */
@@ -297,6 +299,8 @@ export class DroneFly implements DronePanelHost {
     timer: number
     /** 取景前的相机位姿(onBeforeRender 填,onAfterRender 还原) */
     restore: CameraRestore | null
+    /** 在取景相机参与渲染前锁存，避免截图后读取到下一帧状态。 */
+    captureCamera: CaptureCameraState | null
   } | null = null
   /** 云台相机取景用的独立相机(拍照不影响主相机对象本身) */
   private readonly captureCamera = new THREE.PerspectiveCamera()
@@ -949,7 +953,7 @@ export class DroneFly implements DronePanelHost {
           resolve(null)
         }
       }, PHOTO_TIMEOUT_MS)
-      this.photoRequest = { resolve, timer, restore: null }
+      this.photoRequest = { resolve, timer, restore: null, captureCamera: null }
     })
   }
 
@@ -1059,6 +1063,7 @@ export class DroneFly implements DronePanelHost {
       instant: true,
     })
     camera.updateMatrixWorld(true)
+    request.captureCamera = this.getCaptureCamera()
   }
 
   /** 渲染后钩子:与渲染同一任务内拷屏,然后把相机位姿还原 */
@@ -1068,6 +1073,7 @@ export class DroneFly implements DronePanelHost {
     this.photoRequest = null
     window.clearTimeout(request.timer)
     const shot = this.grabCanvas()
+    if (shot && request.captureCamera) shot.camera = request.captureCamera
     // 成片才计数:sim.takePhoto 负责 photoCount +1 与事件日志(实际成像由引擎层负责,见其注释)
     if (shot) this.sim.takePhoto()
     if (request.restore) this.restoreCamera(request.restore)

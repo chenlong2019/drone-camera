@@ -62,6 +62,7 @@ import { CesiumDroneRig } from './drone-cesium-rig'
 import { CesiumMissionEditor } from './drone-cesium-mission'
 import type { CesiumMissionHost } from './drone-cesium-mission'
 import type { MissionEditLimits, MissionEditState } from './mission-editor'
+import { cameraQuaternionFromBasis } from './drone-photogrammetry'
 
 /** Cesium 由 /Cesium/Cesium.js 以全局脚本注入,这里只做一层薄封装取引用 */
 type CesiumNS = Record<string, any>
@@ -340,6 +341,8 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
     timer: number
     settledFrames: number
     forceCapture: boolean
+    /** 在取景相机真正渲染前锁存，保证 PNG 与位姿来自同一帧。 */
+    captureCamera: CaptureCameraState | null
   } | null = null
   /** 拍照稳定帧期间暂存的用户相机,完成或超时后还原 */
   private photoCameraRestore: {
@@ -362,6 +365,8 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
    * 云台 Pan 机械行程转不出 180°(理由见 `drone-panorama` 的文件头)。
    */
   private captureView: CaptureViewOverride | null = null
+  /** true while the Cesium camera is temporarily rendering the capture frame. */
+  private captureFrameActive = false
 
   /** 宿主回调:模型切换完成后通知 UI 刷新按钮文案 */
   onModelChange: ((spec: DroneModelSpec) => void) | null = null
@@ -452,6 +457,7 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
       this.restoreCamera(this.photoCameraRestore.camera)
     }
     this.photoCameraRestore = null
+    this.captureFrameActive = false
     this.recordStream?.getTracks().forEach((track) => track.stop())
     this.recordStream = null
     this.captureTrack = null
@@ -803,11 +809,33 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
     const { destination, heading, pitch, roll } = this.gimbalCameraView()
     // 与 camera.setView({orientation:{heading,pitch,roll}}) 内部用的是同一个换算,
     // 所以这个四元数就是相机此刻的真实姿态(而不是另算一套近似)。
-    const rotation = C.Transforms.headingPitchRollQuaternion(
+    let rotation = C.Transforms.headingPitchRollQuaternion(
       destination,
       new C.HeadingPitchRoll(heading, pitch, roll),
     )
-    const carto = C.Cartographic.fromCartesian(destination)
+    let position = destination
+    // During an actual capture use the rendered camera basis. This records the
+    // camera-local-to-world rotation of the exact frame copied to the PNG,
+    // including Cesium's current reference transform, instead of rebuilding a
+    // quaternion from HPR after the frame has been restored.
+    if (this.captureFrameActive) {
+      const rendered = this.viewer.camera
+      const right = rendered.rightWC
+      const up = rendered.upWC
+      const forward = rendered.directionWC
+      if (right && up && forward && rendered.positionWC) {
+        rotation = cameraQuaternionFromBasis(
+          {
+            right: [right.x, right.y, right.z],
+            up: [up.x, up.y, up.z],
+            forward: [forward.x, forward.y, forward.z],
+          },
+          'cesium',
+        )
+        position = C.Cartesian3.clone(rendered.positionWC)
+      }
+    }
+    const carto = C.Cartographic.fromCartesian(position)
     // PerspectiveFrustum.fovy 是**垂直**视场角(弧度)
     const fovY: number =
       typeof this.viewer.camera.frustum?.fovy === 'number'
@@ -821,7 +849,7 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
 
     return {
       pose: {
-        position: [destination.x, destination.y, destination.z],
+        position: [position.x, position.y, position.z],
         rotation: [rotation.x, rotation.y, rotation.z, rotation.w],
         coordinateFrame: 'ecef',
       },
@@ -928,6 +956,7 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
     if (!photo && this.photoCameraRestore) {
       if (this.photoCameraRestore.camera) this.restoreCamera(this.photoCameraRestore.camera)
       this.photoCameraRestore = null
+      this.captureFrameActive = false
       this.setCaptureFrameVisible(true)
       restoredAfterTimeout = true
     }
@@ -944,6 +973,10 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
     if (photo && !this.photoCameraRestore) this.photoCameraRestore = { camera: restore }
     if (!fpv) this.applyGimbalCameraPose()
     this.setCaptureFrameVisible(false)
+    if (photo) {
+      this.captureFrameActive = true
+      photo.captureCamera = this.getCaptureCamera()
+    }
     this.viewer.render()
     if (recording) this.pushRecordFrame()
     // 首帧 setView 后 Cesium 可能仍显示上一视角的地形/影像瓦片;保持取景位姿,
@@ -960,12 +993,16 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
       this.photoPending = null
       window.clearTimeout(photo.timer)
       const shot = this.grabCanvas()
+      if (shot && photo.captureCamera) shot.camera = photo.captureCamera
       // 成片才计数(与 three 版 onAfterRender 一致)
       if (shot) this.sim.takePhoto()
       photo.resolve(shot)
     }
     this.setCaptureFrameVisible(true)
-    if (photo) this.photoCameraRestore = null
+    if (photo) {
+      this.photoCameraRestore = null
+      this.captureFrameActive = false
+    }
     if (restore) {
       this.restoreCamera(restore)
       this.viewer.render()
@@ -1587,7 +1624,13 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
   async requestPhoto(): Promise<PhotoShot | null> {
     if (this.disposed || this.photoPending) return null
     return new Promise<PhotoShot | null>((resolve) => {
-      const pending = { resolve, timer: 0, settledFrames: 0, forceCapture: false }
+      const pending = {
+        resolve,
+        timer: 0,
+        settledFrames: 0,
+        forceCapture: false,
+        captureCamera: null as CaptureCameraState | null,
+      }
       pending.timer = window.setTimeout(() => {
         if (this.photoPending === pending) pending.forceCapture = true
       }, PHOTO_TIMEOUT_MS)

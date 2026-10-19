@@ -560,7 +560,11 @@ export class DroneCapturePanel {
     if (this.options.downloadOnExport !== false && typeof document !== 'undefined') {
       const mime = format === 'csv' ? 'text/csv' : 'application/json'
       const url = URL.createObjectURL(new Blob([text], { type: `${mime};charset=utf-8` }))
-      triggerDownload(url, `capture-${session.options.name}-${stamp()}.${format}`)
+      const extension = format === 'manifest' ? 'json' : format
+      triggerDownload(
+        url,
+        `capture-${session.options.name}-${stamp()}${format === 'manifest' ? '-manifest' : ''}.${extension}`,
+      )
       // 下载已经开始,URL 可以立刻回收
       URL.revokeObjectURL(url)
     }
@@ -652,6 +656,7 @@ export class DroneCapturePanel {
           <p class="dcap-hint">按组合分组浏览;全景组可「一键合成」成一张等距柱状全景图。</p>
           <div class="dcap-row" style="margin-top:6px">
             <button type="button" class="dcap-btn" data-action="export" data-format="json">导出 JSON</button>
+            <button type="button" class="dcap-btn" data-action="export" data-format="manifest">导出 Manifest</button>
             <button type="button" class="dcap-btn" data-action="export" data-format="csv">导出 CSV</button>
             <button type="button" class="dcap-btn" data-action="clear-images">清空</button>
           </div>
