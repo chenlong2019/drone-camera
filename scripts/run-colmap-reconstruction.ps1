@@ -59,6 +59,12 @@ $sparse = Join-Path $output 'sparse'
 $dense = Join-Path $output 'dense'
 $mesh = Join-Path $output 'mesh'
 $reportPath = Join-Path $output 'reconstruction-report.json'
+$stalePaths = @($database, $sparse, $dense, $mesh)
+foreach ($stalePath in $stalePaths) {
+  if (Test-Path -LiteralPath $stalePath) {
+    Remove-Item -LiteralPath $stalePath -Recurse -Force
+  }
+}
 $invariant = [Globalization.CultureInfo]::InvariantCulture
 $cameraParams = @($camera.fx, $camera.fy, $camera.cx, $camera.cy) | ForEach-Object {
   ([double]$_).ToString('R', $invariant)
@@ -131,9 +137,12 @@ try {
   $modelDirectories = @(Get-ChildItem -LiteralPath $sparse -Directory | Where-Object { $_.Name -match '^\d+$' })
   if ($modelDirectories.Count -eq 0) { throw 'COLMAP mapper did not produce a sparse model directory.' }
   # COLMAP may write model 1 (or another id) instead of always model 0.
-  # images.bin size is a conservative proxy for the registered-image count.
+  # Prefer reconstructed 3D points, then registered-frame data. images.bin
+  # size is not a reliable image-count proxy because binary records vary.
   $model = $modelDirectories |
-    Sort-Object { $file = Join-Path $_.FullName 'images.bin'; if (Test-Path -LiteralPath $file) { (Get-Item -LiteralPath $file).Length } else { 0 } } -Descending |
+    Sort-Object `
+      @{ Expression = { $file = Join-Path $_.FullName 'points3D.bin'; if (Test-Path -LiteralPath $file) { (Get-Item -LiteralPath $file).Length } else { 0 } }; Descending = $true },
+      @{ Expression = { $file = Join-Path $_.FullName 'frames.bin'; if (Test-Path -LiteralPath $file) { (Get-Item -LiteralPath $file).Length } else { 0 } }; Descending = $true } |
     Select-Object -First 1 |
     Select-Object -ExpandProperty FullName
 

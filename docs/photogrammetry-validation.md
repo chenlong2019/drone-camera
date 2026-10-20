@@ -147,7 +147,9 @@ colmap mapper `
 Get-ChildItem $Sparse -Directory | Select-Object Name, FullName
 $SparseModel = Get-ChildItem $Sparse -Directory |
   Where-Object { $_.Name -match '^\d+$' } |
-  Sort-Object { $p = Join-Path $_.FullName 'images.bin'; if (Test-Path $p) { (Get-Item $p).Length } else { 0 } } -Descending |
+  Sort-Object `
+    @{ Expression = { $p = Join-Path $_.FullName 'points3D.bin'; if (Test-Path $p) { (Get-Item $p).Length } else { 0 } }; Descending = $true }, `
+    @{ Expression = { $p = Join-Path $_.FullName 'frames.bin'; if (Test-Path $p) { (Get-Item $p).Length } else { 0 } }; Descending = $true } |
   Select-Object -First 1 -ExpandProperty FullName
 ```
 
