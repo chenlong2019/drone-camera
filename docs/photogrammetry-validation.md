@@ -128,16 +128,27 @@ colmap exhaustive_matcher --database_path $Database
 colmap mapper `
   --database_path $Database `
   --image_path $Images `
-  --output_path $Sparse
+  --output_path $Sparse `
+  --Mapper.multiple_models 1 `
+  --Mapper.init_min_num_inliers 10 `
+  --Mapper.min_num_matches 5 `
+  --Mapper.init_min_tri_angle 0.1 `
+  --Mapper.tri_min_angle 0.1 `
+  --Mapper.abs_pose_min_num_inliers 5 `
+  --Mapper.abs_pose_min_inlier_ratio 0.05 `
+  --Mapper.filter_max_reproj_error 8
 ```
 
 当前验证页默认导出 `PINHOLE`，其参数顺序是 `fx,fy,cx,cy`。如果实际 Manifest 的 `camera.model` 是 `OPENCV` 等模型，必须按该模型要求提供畸变参数，不能继续使用上面的四参数字符串。检查 `$Sparse` 下生成的模型目录，并选注册照片数最多的目录（只有一个模型时通常是 `0`）：
 
 ```powershell
-# mapper 默认写入 cameras.bin、images.bin、points3D.bin；多个模型时用
-# `colmap gui --import_path <model>` 或 `colmap model_converter` 检查注册数。
+# mapper 默认写入 cameras.bin、images.bin、points3D.bin；低纹理小场景
+# 可能输出多个模型，应选择注册图像数最多的目录，不要固定使用 0。
 Get-ChildItem $Sparse -Directory | Select-Object Name, FullName
-$SparseModel = Join-Path $Sparse '0'
+$SparseModel = Get-ChildItem $Sparse -Directory |
+  Where-Object { $_.Name -match '^\d+$' } |
+  Sort-Object { $p = Join-Path $_.FullName 'images.bin'; if (Test-Path $p) { (Get-Item $p).Length } else { 0 } } -Descending |
+  Select-Object -First 1 -ExpandProperty FullName
 ```
 
 如果需要稠密点云和网格，继续执行：

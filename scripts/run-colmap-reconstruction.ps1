@@ -78,7 +78,16 @@ function Find-Option([string]$Command, [string[]]$Candidates) {
   # COLMAP changed the SIFT GPU option names across releases. Resolve the
   # option from this installation instead of making one version-specific flag
   # mandatory for every run.
-  $help = (& $ColmapExe $Command '-h' 2>&1 | Out-String)
+  # Some Windows builds print the help banner to stderr. With the script's
+  # global Stop policy, that normal output becomes a terminating error, so
+  # temporarily allow the native probe to complete and capture both streams.
+  $previousErrorActionPreference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $help = (& $ColmapExe $Command '-h' 2>&1 | Out-String)
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
   foreach ($candidate in $Candidates) {
     if ($help -match [regex]::Escape($candidate)) { return $candidate }
   }
@@ -105,9 +114,28 @@ try {
   Invoke-Colmap $matchingArguments 'matching'
 
   $null = New-Item -ItemType Directory -Force -Path $sparse
-  Invoke-Colmap @('mapper', '--database_path', $database, '--image_path', $images, '--output_path', $sparse) 'sfm'
-  $model = Join-Path $sparse '0'
-  if (-not (Test-Path -LiteralPath $model)) { throw 'COLMAP mapper did not produce sparse/0.' }
+  # The validation set is small and mostly planar. Relax only the seed and
+  # pose thresholds enough to form a model; inspect registered-image counts
+  # and geometry before treating the output as a usable reconstruction.
+  Invoke-Colmap @(
+    'mapper', '--database_path', $database, '--image_path', $images, '--output_path', $sparse,
+    '--Mapper.multiple_models', '1',
+    '--Mapper.init_min_num_inliers', '10',
+    '--Mapper.min_num_matches', '5',
+    '--Mapper.init_min_tri_angle', '0.1',
+    '--Mapper.tri_min_angle', '0.1',
+    '--Mapper.abs_pose_min_num_inliers', '5',
+    '--Mapper.abs_pose_min_inlier_ratio', '0.05',
+    '--Mapper.filter_max_reproj_error', '8'
+  ) 'sfm'
+  $modelDirectories = @(Get-ChildItem -LiteralPath $sparse -Directory | Where-Object { $_.Name -match '^\d+$' })
+  if ($modelDirectories.Count -eq 0) { throw 'COLMAP mapper did not produce a sparse model directory.' }
+  # COLMAP may write model 1 (or another id) instead of always model 0.
+  # images.bin size is a conservative proxy for the registered-image count.
+  $model = $modelDirectories |
+    Sort-Object { $file = Join-Path $_.FullName 'images.bin'; if (Test-Path -LiteralPath $file) { (Get-Item -LiteralPath $file).Length } else { 0 } } -Descending |
+    Select-Object -First 1 |
+    Select-Object -ExpandProperty FullName
 
   $null = New-Item -ItemType Directory -Force -Path $dense
   Invoke-Colmap @('image_undistorter', '--image_path', $images, '--input_path', $model, '--output_path', $dense, '--output_type', 'COLMAP') 'undistort'
