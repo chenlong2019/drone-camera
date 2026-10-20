@@ -8,7 +8,13 @@ param(
 
   [string]$ColmapExe = 'colmap',
 
-  [switch]$UseGpu
+  [switch]$UseGpu,
+
+  [int]$MinRegisteredImages = 6,
+
+  [int]$MinSparsePoints = 100,
+
+  [switch]$AllowSmallSparseModel
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,7 +65,8 @@ $sparse = Join-Path $output 'sparse'
 $dense = Join-Path $output 'dense'
 $mesh = Join-Path $output 'mesh'
 $reportPath = Join-Path $output 'reconstruction-report.json'
-$stalePaths = @($database, $sparse, $dense, $mesh)
+$inspection = Join-Path $output 'sparse-inspection'
+$stalePaths = @($database, $sparse, $dense, $mesh, $inspection)
 foreach ($stalePath in $stalePaths) {
   if (Test-Path -LiteralPath $stalePath) {
     Remove-Item -LiteralPath $stalePath -Recurse -Force
@@ -72,6 +79,8 @@ $cameraParams = @($camera.fx, $camera.fy, $camera.cx, $camera.cy) | ForEach-Obje
 $cameraParams = $cameraParams -join ','
 $started = (Get-Date).ToUniversalTime().ToString('o')
 $stage = 'validate-images'
+$model = $null
+$modelStats = $null
 
 function Invoke-Colmap([string[]]$Arguments, [string]$Stage) {
   $script:stage = $Stage
@@ -100,6 +109,50 @@ function Find-Option([string]$Command, [string[]]$Candidates) {
   return $null
 }
 
+function Get-SparseModelStats([string]$ModelPath, [string]$InspectionPath) {
+  # COLMAP 4.x stores registered images and points in binary files whose
+  # layout changed between releases. Convert a copy to TXT so the quality
+  # gate works across supported Windows builds without parsing those files.
+  $null = New-Item -ItemType Directory -Force -Path $InspectionPath
+  $previousErrorActionPreference = $ErrorActionPreference
+  $exitCode = 1
+  try {
+    $ErrorActionPreference = 'Continue'
+    & $ColmapExe 'model_converter' '--input_path' $ModelPath '--output_path' $InspectionPath '--output_type' 'TXT' 2>&1 | Out-Null
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
+  $imagesTxt = Join-Path $InspectionPath 'images.txt'
+  $pointsTxt = Join-Path $InspectionPath 'points3D.txt'
+  if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $imagesTxt) -or -not (Test-Path -LiteralPath $pointsTxt)) {
+    return $null
+  }
+
+  $registeredImages = 0
+  foreach ($line in Get-Content -LiteralPath $imagesTxt) {
+    if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith('#')) { continue }
+    $parts = $line.Trim() -split '\s+'
+    # An image record has 10 fields; the last field is the image name. The
+    # following points2D record contains only numeric fields, so this avoids
+    # counting it as a second image.
+    if ($parts.Count -ge 10 -and $parts[0] -match '^-?\d+$' -and $parts[9] -notmatch '^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$') {
+      $registeredImages++
+    }
+  }
+
+  $sparsePoints = 0
+  foreach ($line in Get-Content -LiteralPath $pointsTxt) {
+    if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith('#')) { continue }
+    $parts = $line.Trim() -split '\s+'
+    if ($parts.Count -ge 8 -and $parts[0] -match '^-?\d+$') { $sparsePoints++ }
+  }
+  return [pscustomobject]@{
+    registeredImages = $registeredImages
+    sparsePoints = $sparsePoints
+  }
+}
+
 $featureGpuOption = Find-Option 'feature_extractor' @('--SiftExtraction.use_gpu', '--FeatureExtraction.use_gpu')
 $matchingGpuOption = Find-Option 'exhaustive_matcher' @('--SiftMatching.use_gpu', '--FeatureMatching.use_gpu')
 if ($UseGpu -and $null -eq $featureGpuOption -and $null -eq $matchingGpuOption) {
@@ -126,6 +179,7 @@ try {
   Invoke-Colmap @(
     'mapper', '--database_path', $database, '--image_path', $images, '--output_path', $sparse,
     '--Mapper.multiple_models', '1',
+    '--Mapper.min_model_size', '3',
     '--Mapper.init_min_num_inliers', '10',
     '--Mapper.min_num_matches', '5',
     '--Mapper.init_min_tri_angle', '0.1',
@@ -145,6 +199,16 @@ try {
       @{ Expression = { $file = Join-Path $_.FullName 'frames.bin'; if (Test-Path -LiteralPath $file) { (Get-Item -LiteralPath $file).Length } else { 0 } }; Descending = $true } |
     Select-Object -First 1 |
     Select-Object -ExpandProperty FullName
+
+  $stage = 'sparse-quality'
+  $modelStats = Get-SparseModelStats $model $inspection
+  if ($null -eq $modelStats) {
+    throw "Unable to inspect sparse model '$model'. COLMAP model_converter did not produce images.txt and points3D.txt."
+  }
+  Write-Host "[sparse-quality] model $([System.IO.Path]::GetFileName($model)): $($modelStats.registeredImages) registered images, $($modelStats.sparsePoints) points"
+  if (-not $AllowSmallSparseModel -and ($modelStats.registeredImages -lt $MinRegisteredImages -or $modelStats.sparsePoints -lt $MinSparsePoints)) {
+    throw "Sparse model is too small for dense reconstruction: $($modelStats.registeredImages) registered images and $($modelStats.sparsePoints) points. Need at least $MinRegisteredImages registered images and $MinSparsePoints points; capture more continuous, overlapping views, or pass -AllowSmallSparseModel to try dense anyway."
+  }
 
   $null = New-Item -ItemType Directory -Force -Path $dense
   Invoke-Colmap @('image_undistorter', '--image_path', $images, '--input_path', $model, '--output_path', $dense, '--output_type', 'COLMAP') 'undistort'
@@ -169,6 +233,9 @@ $report = [ordered]@{
   startedAt = $started
   finishedAt = $finished
   totalImages = [int]$manifestImages.Count
+  sparseModel = if ($null -ne $model) { [System.IO.Path]::GetFileName($model) } else { $null }
+  registeredImages = if ($null -ne $modelStats) { [int]$modelStats.registeredImages } else { $null }
+  sparsePoints = if ($null -ne $modelStats) { [int]$modelStats.sparsePoints } else { $null }
   errors = $errors
   warnings = @('COLMAP output is not a 3D Tiles tileset; convert and visually inspect it before loading in Cesium.')
 }

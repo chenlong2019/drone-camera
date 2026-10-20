@@ -113,3 +113,5 @@ COLMAP 的 `images.txt` 使用世界到相机的 `qvec [w,x,y,z]` 和 `tvec`。�
 COLMAP 输出的 PLY 网格不是 3D Tiles。需要使用项目选定的转换器（例如 `py3dtiles`，或 Cesium ion/企业内部 tiler）生成 `tileset.json` 及其内容文件，并通过 HTTP(S) 提供。将最终 `tileset.json` 的 URL 填回验证页的“Tiles 图层”输入框进行回载和人工验收。
 
 页面内置的 `/validation/tileset.json` 是合成加载样例，不是上述照片的重建结果。
+
+脚本现在会在启动 MVS 前检查选中的稀疏模型。注册图像或稀疏点不足时会保留 sparse/ 并给出明确错误，避免 COLMAP dense 原生崩溃。默认要求至少 6 张注册图像和 100 个稀疏点；只有诊断时才使用 -AllowSmallSparseModel。
