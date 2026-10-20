@@ -63,7 +63,7 @@ function switchModel(): void {
 </template>
 
 <style>
-@import url('/Cesium/Widgets/widgets.css');
+/* Cesium 的 widgets.css 由 use-cesium-demo 在运行时按 BASE_URL 注入（子路径部署下 @import 的绝对路径会 404） */
 
 .cesium-page,
 .cesium-container {

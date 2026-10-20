@@ -14,6 +14,9 @@ import {
   validateTileset,
   type TilesetValidationResult,
 } from '@/lib/drone-camera/drone-photogrammetry'
+import { assetUrl, ensureStylesheet } from '@/utils/asset-url'
+
+const CESIUM_DIR = assetUrl('Cesium')
 
 export const VALIDATION_ORIGIN = { longitude: 116.391, latitude: 39.906, altitude: 0 }
 export const CAPTURE_WIDTH = 960
@@ -40,7 +43,9 @@ type RenderedFrame = {
 
 /** Fixed-position integration harness: real adapter capture without a flight mission. */
 export async function createValidationScene(container: HTMLElement, signal: AbortSignal) {
-  await loadCesiumScript('/Cesium/Cesium.js')
+  ;(window as unknown as { CESIUM_BASE_URL?: string }).CESIUM_BASE_URL = `${CESIUM_DIR}/`
+  ensureStylesheet(`${CESIUM_DIR}/Widgets/widgets.css`)
+  await loadCesiumScript(`${CESIUM_DIR}/Cesium.js`)
   signal.throwIfAborted()
   const C = window.Cesium!
   const viewer = new C.Viewer(container, {
@@ -126,6 +131,8 @@ export async function createValidationScene(container: HTMLElement, signal: Abor
     lon: VALIDATION_ORIGIN.longitude,
     lat: VALIDATION_ORIGIN.latitude,
     height: 0,
+    // 子路径部署时,DRONE_MODELS 里的站内绝对路径要加前缀
+    assetBase: import.meta.env.BASE_URL.replace(/\/$/, ''),
   })
   adapter.setMissionEditEnabled(false)
   const preview = new ReconstructionPreview<CesiumObject, CesiumObject>({

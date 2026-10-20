@@ -9,6 +9,8 @@
 ![three.js](https://img.shields.io/badge/three.js-%3E%3D0.180-black)
 ![CesiumJS](https://img.shields.io/badge/CesiumJS-compatible-6CADDF)
 
+**▶ [Live demo](https://chenlong2019.github.io/drone-camera/)** — three.js & CesiumJS backends, panorama, mission editing, all in the browser.
+
 [中文文档](./README.zh-CN.md)
 
 </div>

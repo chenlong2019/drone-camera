@@ -8,6 +8,7 @@
   loadCesiumScript,
 } from '@/lib'
 import type { DroneModelSpec } from '@/lib'
+import { assetUrl, ensureStylesheet } from '@/utils/asset-url'
 
 /** Optional Cesium ion token supplied at build time through VITE_CESIUM_ION_TOKEN. */
 const ION_TOKEN = import.meta.env.VITE_CESIUM_ION_TOKEN?.trim() ?? ''
@@ -16,8 +17,11 @@ const HAS_ION_TOKEN = Boolean(ION_TOKEN && ION_TOKEN !== '******')
 declare global {
   interface Window {
     Cesium?: Record<string, any>
+    CESIUM_BASE_URL?: string
   }
 }
+
+const CESIUM_DIR = assetUrl('Cesium')
 
 const ORIGIN = { lon: 116.391, lat: 39.906 }
 
@@ -37,7 +41,10 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
   let captureService: CaptureService | null = null
 
   async function init(): Promise<void> {
-    await loadCesiumScript('/Cesium/Cesium.js')
+    // Cesium 内部按 CESIUM_BASE_URL 拼 Workers / Assets 路径，必须显式给，否则子路径部署下全是 404
+    window.CESIUM_BASE_URL = `${CESIUM_DIR}/`
+    ensureStylesheet(`${CESIUM_DIR}/Widgets/widgets.css`)
+    await loadCesiumScript(`${CESIUM_DIR}/Cesium.js`)
     const Cesium = window.Cesium!
     if (HAS_ION_TOKEN) {
       Cesium.Ion.defaultAccessToken = ION_TOKEN
@@ -103,6 +110,8 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
       viewer: v,
       lon: ORIGIN.lon,
       lat: ORIGIN.lat,
+      // 子路径部署(GitHub Pages 的 /drone-camera/)时,DRONE_MODELS 里的站内绝对路径要加前缀
+      assetBase: import.meta.env.BASE_URL.replace(/\/$/, ''),
     })
     // 与 three 页同款演示开关:`?unlimited=1` 取消限高 / 限距
     if (new URLSearchParams(window.location.search).get('unlimited') === '1') {

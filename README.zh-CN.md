@@ -6,6 +6,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
+**▶ [在线 Demo](https://chenlong2019.github.io/drone-camera/)** —— three.js 与 CesiumJS 双后端、全景、航线编辑,浏览器里直接体验。
+
 [English](./README.md)
 
 </div>

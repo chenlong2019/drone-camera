@@ -40,6 +40,12 @@ const router = createRouter({
       component: () => import('../views/class-map/class-map.vue'),
       meta: { title: '类与方法', menu: true },
     },
+    {
+      path: '/static-scene',
+      name: 'StaticScene',
+      component: () => import('../views/static-scene/static-scene.vue'),
+      meta: { title: '静态场景', menu: true },
+    },
   ],
 })
 

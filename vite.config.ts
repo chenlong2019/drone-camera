@@ -7,6 +7,8 @@ import vueDevTools from "vite-plugin-vue-devtools";
 
 // https://vite.dev/config/
 export default defineConfig({
+  // GitHub Pages 部署在 `/<repo>/` 子路径下，构建时用 APP_BASE 覆盖；其余场景保持根路径。
+  base: process.env.APP_BASE || '/',
   plugins: [vue(), vueJsx(), vueDevTools()],
   resolve: {
     alias: {

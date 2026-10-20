@@ -147,6 +147,12 @@ export interface CesiumDroneOptions {
    * 传 `[]` 关闭净化,直接按原 URL 加载。
    */
   stripRequiredExtensions?: readonly string[]
+  /**
+   * 静态资源根路径前缀,用于解析 `DRONE_MODELS[].url` 这类站内绝对路径。
+   * 站点部署在子路径下(如 GitHub Pages 的 `/drone-camera/`)时传 `'/drone-camera'`,
+   * 缺省为空 = 按站点根解析。
+   */
+  assetBase?: string
 }
 
 /** 飞行中每帧推进仿真用的最大步长(秒):切标签页回来时防止一次跳太远 */
@@ -304,6 +310,8 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
   private readonly followRange: number
   /** 加载期净化时的扩展剥离清单(见 stripRequiredExtensions) */
   private readonly stripExtensions: readonly string[]
+  /** 站内静态资源前缀(子路径部署),空串 = 站点根 */
+  private readonly assetBase: string
   /** 当前机体若走了净化路径,记下 Blob URL 以便销毁时回收 */
   private sanitizedBlobUrl: string | null = null
 
@@ -390,6 +398,7 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
     this.modelIndex = options.modelIndex ?? 0
     this.stripExtensions =
       options.stripRequiredExtensions ?? DEFAULT_UNSUPPORTED_REQUIRED_EXTENSIONS
+    this.assetBase = (options.assetBase ?? '').replace(/\/+$/, '')
     this.origin = {
       lon: options.lon ?? 116.391,
       lat: options.lat ?? 39.906,
@@ -485,6 +494,15 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
   }
 
   /**
+   * 把 `DRONE_MODELS` 里的站内绝对路径前缀上 `assetBase`(子路径部署时用)。
+   * 已经是 http(s) / blob / data URL 或相对路径的,原样返回。
+   */
+  private withAssetBase(url: string): string {
+    if (!this.assetBase || !url.startsWith('/')) return url
+    return `${this.assetBase}${url}`
+  }
+
+  /**
    * 解析交给 Cesium 的模型地址:先按原 URL 取 ArrayBuffer,若 `extensionsRequired`
    * 里有 Cesium 不支持的扩展,就在内存里摘掉并用 Blob URL 代替(见文件头"GLB 净化")。
    *
@@ -552,7 +570,7 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
     const spec = this.modelSpec
     const token = ++this.loadToken
     // 净化后的 Blob URL(或原 URL)—— 摘掉 Cesium 不支持的 required 扩展,见文件头
-    const url = await this.resolveModelUrl(spec.url, token)
+    const url = await this.resolveModelUrl(this.withAssetBase(spec.url), token)
     if (this.disposed || token !== this.loadToken) return
     let model: CesiumNS
     try {

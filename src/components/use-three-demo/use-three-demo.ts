@@ -17,9 +17,10 @@ import { PMREMGenerator, PostProcessing, WebGPURenderer } from 'three/webgpu'
 import { pass } from 'three/tsl'
 import { bloom } from 'three/examples/jsm/tsl/display/BloomNode.js'
 import { DemoScenery } from './demo-scenery'
+import { assetUrl } from '@/utils/asset-url'
 
 /** 真机 GLB 路径(需自行放到 public/models 下);不给这个 URL 即用库内置哈士奇机体 */
-const GLB_MODEL_URL = '/models/dji_mini4_pro.glb'
+const GLB_MODEL_URL = assetUrl('models/dji_mini4_pro.glb')
 
 /**
  * 户外 HDRI 环境图(Poly Haven,CC0)。清晨低角度太阳,暖色直射 + 冷色天空漫射,
@@ -29,7 +30,7 @@ const GLB_MODEL_URL = '/models/dji_mini4_pro.glb'
  * 但户外场景的天空方向、色温、地平线全是假的,材质再对也像塑料。这里只在加载失败时兜底。
  * `?hdri=0` 可退回旧的中性环境,便于对比。
  */
-const HDRI_URL = '/hdri/spruit_sunrise_4k.hdr'
+const HDRI_URL = assetUrl('hdri/spruit_sunrise_4k.hdr')
 
 /**
  * 太阳方位:由 HDRI 最亮区域实测反推(tmp-shots/find-sun-page.mjs)——

@@ -14,7 +14,11 @@ import {
 } from '@/lib/drone-camera/drone-photogrammetry'
 import type { CapturedImage } from '@/lib/drone-camera/drone-capture'
 import type { ReconstructionPreviewCompareMode } from '@/lib/drone-camera/drone-reconstruction-preview'
-import { inspectCaptureImages, type InspectedImageQuality } from './image-validation'
+import {
+  inspectCaptureImages,
+  type InspectedImageQuality,
+} from './image-validation'
+import { assetUrl } from '@/utils/asset-url'
 import {
   createValidationScene,
   VALIDATION_ORIGIN,
@@ -183,7 +187,7 @@ function validate() {
 
 function loadTiles(sample = false) {
   void run('加载 Tiles…', async () => {
-    const url = sample ? '/validation/tileset.json' : tilesUrl.value.trim()
+    const url = sample ? assetUrl('validation/tileset.json') : tilesUrl.value.trim()
     if (!url) throw new Error('请输入 tileset.json 地址。')
     lastTilesAttempt.value = { url, status: 'loading', error: null }
     try {
