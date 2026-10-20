@@ -21,6 +21,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-colmap-reconst
 if errorlevel 1 (
   echo.
   echo Reconstruction failed. See the error above.
+  echo Full log: %CAPTURE_DIR%\reconstruction\reconstruction.log
   if exist "%CAPTURE_DIR%\reconstruction\reconstruction-report.json" (
     echo.
     echo Reconstruction report:

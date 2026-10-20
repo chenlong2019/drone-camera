@@ -97,7 +97,11 @@ Manifest 中每个 `images[].file` 都应能从 `capture-directory/` 解析到�
 
 ## 使用 COLMAP 离线重建
 
-验证页只负责采集和导出，不会在浏览器中运行 COLMAP。下面是一套在 Windows PowerShell 中执行的最小流程。先安装与显卡驱动匹配的 [COLMAP](https://colmap.github.io/) 并确认 `colmap` 已在 `PATH` 中，然后将两个下载文件整理为上一节的目录结构。
+验证页只负责采集和导出，不会在浏览器中运行 COLMAP。下面是一套在 Windows PowerShell 中执行的最小流程。先安装与显卡驱动匹配的 [COLMAP](https://colmap.github.io/) 并确认 `colmap` 已在 `PATH` 中，然后将下载文件整理为上一节的目录结构。日常运行建议使用[离线重建脚本](./photogrammetry-reconstruction.md)，由脚本完成版本探测、质量检查并记录日志；以下分步命令供手动检查使用，每一步成功后再执行下一步。
+
+完整流程需要启用 CUDA/HIP 的 GPU 版 COLMAP。`colmap -h` 若显示 `without GPU support`，只能执行这里的 CPU 稀疏流程，不能继续 `patch_match_stereo`。脚本的 `-UseGpu` 只控制 SIFT 特征提取和匹配，不会启用缺失的稠密后端。GTX 1080 Ti 需要包含 Pascal 支持的 CUDA 12 构建和兼容驱动；不应选择不支持 Pascal 的 CUDA 13 构建。
+
+本次 COLMAP 4.2.1 的 `without GPU support` 是 dense 失败首先要解决的能力问题。当前 8 张照片只能形成很小、互不连通的稀疏模型，是另一项数据质量问题；更换 GPU 版 COLMAP 后仍需改善连续视角、重叠和纹理。退出码 `-1073740791` 本身不能证明是小模型导致了崩溃。
 
 先从 Manifest 读取相机内参，再提取特征、匹配并进行稀疏重建：
 
@@ -130,6 +134,7 @@ colmap mapper `
   --image_path $Images `
   --output_path $Sparse `
   --Mapper.multiple_models 1 `
+  --Mapper.min_model_size 3 `
   --Mapper.init_min_num_inliers 10 `
   --Mapper.min_num_matches 5 `
   --Mapper.init_min_tri_angle 0.1 `
@@ -139,21 +144,41 @@ colmap mapper `
   --Mapper.filter_max_reproj_error 8
 ```
 
-当前验证页默认导出 `PINHOLE`，其参数顺序是 `fx,fy,cx,cy`。如果实际 Manifest 的 `camera.model` 是 `OPENCV` 等模型，必须按该模型要求提供畸变参数，不能继续使用上面的四参数字符串。检查 `$Sparse` 下生成的模型目录，并选注册照片数最多的目录（只有一个模型时通常是 `0`）：
+当前验证页默认导出 `PINHOLE`，其参数顺序是 `fx,fy,cx,cy`。如果实际 Manifest 的 `camera.model` 是 `OPENCV` 等模型，必须按该模型要求提供畸变参数，不能继续使用上面的四参数字符串。检查 `$Sparse` 下生成的模型目录，按实际稀疏点数优先、注册图像数次优选择模型（只有一个模型时通常是 `0`）：
 
 ```powershell
-# mapper 默认写入 cameras.bin、images.bin、points3D.bin；低纹理小场景
-# 可能输出多个模型，应选择注册图像数最多的目录，不要固定使用 0。
-Get-ChildItem $Sparse -Directory | Select-Object Name, FullName
-$SparseModel = Get-ChildItem $Sparse -Directory |
+# COLMAP 3.x/4.x 的 images.bin 和 points3D.bin 均以 8 字节
+# 小端 uint64 记录条目数；文件长度不能代替图像数或点数。
+function Read-ModelCount([string]$Path) {
+  $Reader = [System.IO.BinaryReader]::new([System.IO.File]::OpenRead($Path))
+  try { return $Reader.ReadUInt64() } finally { $Reader.Dispose() }
+}
+
+$Models = @(Get-ChildItem -LiteralPath $Sparse -Directory |
   Where-Object { $_.Name -match '^\d+$' } |
+  ForEach-Object {
+    [pscustomobject]@{
+      Path = $_.FullName
+      RegisteredImages = Read-ModelCount (Join-Path $_.FullName 'images.bin')
+      SparsePoints = Read-ModelCount (Join-Path $_.FullName 'points3D.bin')
+    }
+  })
+if ($Models.Count -eq 0) { throw 'No sparse model was produced.' }
+$Models | Format-Table Path, RegisteredImages, SparsePoints
+$SelectedModel = $Models |
   Sort-Object `
-    @{ Expression = { $p = Join-Path $_.FullName 'points3D.bin'; if (Test-Path $p) { (Get-Item $p).Length } else { 0 } }; Descending = $true }, `
-    @{ Expression = { $p = Join-Path $_.FullName 'frames.bin'; if (Test-Path $p) { (Get-Item $p).Length } else { 0 } }; Descending = $true } |
-  Select-Object -First 1 -ExpandProperty FullName
+    @{ Expression = { $_.SparsePoints }; Descending = $true },
+    @{ Expression = { $_.RegisteredImages }; Descending = $true } |
+  Select-Object -First 1
+$SparseModel = $SelectedModel.Path
+if ($SelectedModel.RegisteredImages -lt 6 -or $SelectedModel.SparsePoints -lt 100) {
+  throw 'Sparse model is below the helper quality threshold; inspect it and improve the capture before MVS.'
+}
 ```
 
-如果需要稠密点云和网格，继续执行：
+默认的 6 张注册图像、100 个稀疏点是脚本的经验质量门槛，不是 COLMAP 的硬性限制，也不保证 MVS 成功。脚本参数 `-AllowSmallSparseModel` 仅用于诊断时跳过这项门槛，不能绕过 GPU 能力检查。脚本在清理旧重建输出前检查构建能力；不支持 GPU 时保留已有数据库和模型。各次运行的命令、输出及退出码记录在 `reconstruction/reconstruction.log`，失败阶段和模型计数记录在 `reconstruction-report.json`。
+
+确认 GPU 构建、硬件兼容性和稀疏质量后，如需稠密点云和网格，继续执行：
 
 ```powershell
 $Dense = Join-Path $Work 'dense'
@@ -187,7 +212,7 @@ colmap poisson_mesher `
 
 上面的 `mapper` 会从图像特征重新估计相机位姿，默认坐标系是任意的 COLMAP 局部坐标系。Manifest 中的 `position` 是 Cesium ECEF 米制坐标，`rotation` 是相机到世界的 `[x,y,z,w]` 四元数；它们不会被 `mapper` 自动读取。需要把重建结果放回地图时，应使用 Manifest 的 ENU 原点和 `coordinateFrame.transform` 将 ECEF 转为本地 ENU，并用控制点或已知相机中心做相似变换（尺度、旋转、平移）后再生成 Tiles。不要把 ECEF 相机中心直接写成 COLMAP `tvec`；COLMAP `images.txt` 使用世界到相机的 `qvec=[w,x,y,z]` 和 `tvec=-R*C`。页面显示的 COLMAP 参数和 `cameraPoseToColmap` helper 可用于核对这个转换，但不会替代对齐工具。
 
-如果只想先得到模型，不要求地理坐标，直接使用 `sparse/0`、`dense` 和网格结果即可。真实重建还应记录注册照片数、匹配质量、点云/网格完整性和纹理质量，并把生成的 Tiles URL 填回验证页人工检查。
+如果只想先得到模型，不要求地理坐标，使用选中的 `$SparseModel`、`dense` 和网格结果即可。真实重建还应记录注册照片数、匹配质量、点云/网格完整性和纹理质量，并把生成的 Tiles URL 填回验证页人工检查。
 
 ## Tiles 回载与人工验收
 

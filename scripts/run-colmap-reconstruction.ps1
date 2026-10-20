@@ -10,8 +10,10 @@ param(
 
   [switch]$UseGpu,
 
+  [ValidateRange(2, 2147483647)]
   [int]$MinRegisteredImages = 6,
 
+  [ValidateRange(1, 2147483647)]
   [int]$MinSparsePoints = 100,
 
   [switch]$AllowSmallSparseModel
@@ -65,13 +67,8 @@ $sparse = Join-Path $output 'sparse'
 $dense = Join-Path $output 'dense'
 $mesh = Join-Path $output 'mesh'
 $reportPath = Join-Path $output 'reconstruction-report.json'
-$inspection = Join-Path $output 'sparse-inspection'
-$stalePaths = @($database, $sparse, $dense, $mesh, $inspection)
-foreach ($stalePath in $stalePaths) {
-  if (Test-Path -LiteralPath $stalePath) {
-    Remove-Item -LiteralPath $stalePath -Recurse -Force
-  }
-}
+$logPath = Join-Path $output 'reconstruction.log'
+Set-Content -LiteralPath $logPath -Value '' -Encoding utf8
 $invariant = [Globalization.CultureInfo]::InvariantCulture
 $cameraParams = @($camera.fx, $camera.fy, $camera.cx, $camera.cy) | ForEach-Object {
   ([double]$_).ToString('R', $invariant)
@@ -81,87 +78,100 @@ $started = (Get-Date).ToUniversalTime().ToString('o')
 $stage = 'validate-images'
 $model = $null
 $modelStats = $null
+$colmapVersion = $null
+$gpuBuild = $null
+$helpCache = @{}
 
-function Invoke-Colmap([string[]]$Arguments, [string]$Stage) {
+function Invoke-Colmap([string[]]$Arguments, [string]$Stage, [switch]$CaptureOutput) {
   $script:stage = $Stage
-  Write-Host "[$Stage] colmap $($Arguments -join ' ')"
-  & $ColmapExe @Arguments
-  if ($LASTEXITCODE -ne 0) { throw "COLMAP stage failed ($Stage), exit code $LASTEXITCODE" }
+  $commandLine = "[$Stage] $ColmapExe $($Arguments -join ' ')"
+  Write-Host $commandLine
+  $lines = [System.Collections.Generic.List[string]]::new()
+  $writer = [System.IO.StreamWriter]::new($logPath, $true, [System.Text.UTF8Encoding]::new($false))
+  $writer.AutoFlush = $true
+  $writer.WriteLine($commandLine)
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    # Windows PowerShell wraps native stderr as ErrorRecord even for normal
+    # COLMAP progress/help. Capture it as text and use the process exit code.
+    $ErrorActionPreference = 'Continue'
+    & $ColmapExe @Arguments 2>&1 | ForEach-Object {
+      $line = $_.ToString()
+      $writer.WriteLine($line)
+      if ($CaptureOutput) { $lines.Add($line) } else { Write-Host $line }
+    }
+    $exitCode = $LASTEXITCODE
+    $writer.WriteLine("[$Stage] exit code $exitCode")
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+    $writer.Dispose()
+  }
+  if ($exitCode -ne 0) { throw "COLMAP stage failed ($Stage), exit code $exitCode. See $logPath" }
+  if ($CaptureOutput) { return ($lines -join [Environment]::NewLine) }
 }
 
 function Find-Option([string]$Command, [string[]]$Candidates) {
-  # COLMAP changed the SIFT GPU option names across releases. Resolve the
-  # option from this installation instead of making one version-specific flag
-  # mandatory for every run.
-  # Some Windows builds print the help banner to stderr. With the script's
-  # global Stop policy, that normal output becomes a terminating error, so
-  # temporarily allow the native probe to complete and capture both streams.
-  $previousErrorActionPreference = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
-  try {
-    $help = (& $ColmapExe $Command '-h' 2>&1 | Out-String)
-  } finally {
-    $ErrorActionPreference = $previousErrorActionPreference
+  if (-not $helpCache.ContainsKey($Command)) {
+    $helpCache[$Command] = Invoke-Colmap @($Command, '-h') 'environment' -CaptureOutput
   }
   foreach ($candidate in $Candidates) {
-    if ($help -match [regex]::Escape($candidate)) { return $candidate }
+    if ($helpCache[$Command] -match [regex]::Escape($candidate)) { return $candidate }
   }
   return $null
 }
 
-function Get-SparseModelStats([string]$ModelPath, [string]$InspectionPath) {
-  # COLMAP 4.x stores registered images and points in binary files whose
-  # layout changed between releases. Convert a copy to TXT so the quality
-  # gate works across supported Windows builds without parsing those files.
-  $null = New-Item -ItemType Directory -Force -Path $InspectionPath
-  $previousErrorActionPreference = $ErrorActionPreference
-  $exitCode = 1
+function Read-ModelCount([string]$Path) {
+  # COLMAP images.bin and points3D.bin both start with a little-endian uint64
+  # record count in 3.x and 4.x. File sizes also include observations/tracks
+  # and therefore cannot be used to rank image or point counts.
+  $reader = [System.IO.BinaryReader]::new([System.IO.File]::OpenRead($Path))
   try {
-    $ErrorActionPreference = 'Continue'
-    & $ColmapExe 'model_converter' '--input_path' $ModelPath '--output_path' $InspectionPath '--output_type' 'TXT' 2>&1 | Out-Null
-    $exitCode = $LASTEXITCODE
+    return $reader.ReadUInt64()
   } finally {
-    $ErrorActionPreference = $previousErrorActionPreference
+    $reader.Dispose()
   }
-  $imagesTxt = Join-Path $InspectionPath 'images.txt'
-  $pointsTxt = Join-Path $InspectionPath 'points3D.txt'
-  if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $imagesTxt) -or -not (Test-Path -LiteralPath $pointsTxt)) {
-    return $null
-  }
+}
 
-  $registeredImages = 0
-  foreach ($line in Get-Content -LiteralPath $imagesTxt) {
-    if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith('#')) { continue }
-    $parts = $line.Trim() -split '\s+'
-    # An image record has 10 fields; the last field is the image name. The
-    # following points2D record contains only numeric fields, so this avoids
-    # counting it as a second image.
-    if ($parts.Count -ge 10 -and $parts[0] -match '^-?\d+$' -and $parts[9] -notmatch '^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$') {
-      $registeredImages++
+function Get-SparseModelStats([string]$ModelPath) {
+  return [pscustomobject]@{
+    path = $ModelPath
+    registeredImages = Read-ModelCount (Join-Path $ModelPath 'images.bin')
+    sparsePoints = Read-ModelCount (Join-Path $ModelPath 'points3D.bin')
+  }
+}
+
+try {
+  # Help for patch_match_stereo also succeeds in CPU-only builds. The build
+  # banner is what identifies the missing backend. Check before deleting any
+  # previous reconstruction, and regardless of the SIFT -UseGpu setting.
+  $help = Invoke-Colmap @('-h') 'environment' -CaptureOutput
+  $colmapVersion = ($help -split '\r?\n' | Where-Object { $_ -match 'COLMAP \d' } | Select-Object -First 1)
+  if ($colmapVersion -match '(?i)\bwithout\s+(GPU|CUDA|HIP)\b') {
+    $gpuBuild = $false
+    throw 'This COLMAP build has no GPU support. patch_match_stereo requires a CUDA/HIP-enabled build and compatible hardware. Install a GPU-enabled COLMAP build for your GPU (GTX 10-series requires a build supporting Pascal, e.g. CUDA 12). -UseGpu only controls SIFT; it cannot enable dense reconstruction in this build. Existing reconstruction data was preserved.'
+  }
+  if ($colmapVersion -match '(?i)\bwith\s+(GPU|CUDA|HIP)\b') { $gpuBuild = $true }
+
+  $featureGpuOption = Find-Option 'feature_extractor' @('--SiftExtraction.use_gpu', '--FeatureExtraction.use_gpu')
+  $matchingGpuOption = Find-Option 'exhaustive_matcher' @('--SiftMatching.use_gpu', '--FeatureMatching.use_gpu')
+  $featureGpuArgs = if ($null -ne $featureGpuOption) { @($featureGpuOption, $(if ($UseGpu) { '1' } else { '0' })) } else { @() }
+  $matchingGpuArgs = if ($null -ne $matchingGpuOption) { @($matchingGpuOption, $(if ($UseGpu) { '1' } else { '0' })) } else { @() }
+
+  $stage = 'prepare-output'
+  $outputPrefix = $output.TrimEnd('\') + '\'
+  foreach ($stalePath in @($database, $sparse, $dense, $mesh)) {
+    if (Test-Path -LiteralPath $stalePath) {
+      $resolved = (Resolve-Path -LiteralPath $stalePath).Path
+      if (-not $resolved.StartsWith($outputPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cleanup path is outside the output directory: $resolved"
+      }
+      if ((Get-Item -LiteralPath $resolved).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Refusing to clean a linked output path: $resolved"
+      }
+      Remove-Item -LiteralPath $resolved -Recurse -Force
     }
   }
 
-  $sparsePoints = 0
-  foreach ($line in Get-Content -LiteralPath $pointsTxt) {
-    if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith('#')) { continue }
-    $parts = $line.Trim() -split '\s+'
-    if ($parts.Count -ge 8 -and $parts[0] -match '^-?\d+$') { $sparsePoints++ }
-  }
-  return [pscustomobject]@{
-    registeredImages = $registeredImages
-    sparsePoints = $sparsePoints
-  }
-}
-
-$featureGpuOption = Find-Option 'feature_extractor' @('--SiftExtraction.use_gpu', '--FeatureExtraction.use_gpu')
-$matchingGpuOption = Find-Option 'exhaustive_matcher' @('--SiftMatching.use_gpu', '--FeatureMatching.use_gpu')
-if ($UseGpu -and $null -eq $featureGpuOption -and $null -eq $matchingGpuOption) {
-  Write-Warning 'This COLMAP version does not expose SIFT GPU switches; COLMAP will choose its default acceleration mode.'
-}
-$featureGpuArgs = if ($null -ne $featureGpuOption) { @($featureGpuOption, $(if ($UseGpu) { '1' } else { '0' })) } else { @() }
-$matchingGpuArgs = if ($null -ne $matchingGpuOption) { @($matchingGpuOption, $(if ($UseGpu) { '1' } else { '0' })) } else { @() }
-
-try {
   $featureArguments = @(
     'feature_extractor', '--database_path', $database, '--image_path', $images,
     '--ImageReader.single_camera', '1', '--ImageReader.camera_model', 'PINHOLE',
@@ -190,22 +200,17 @@ try {
   ) 'sfm'
   $modelDirectories = @(Get-ChildItem -LiteralPath $sparse -Directory | Where-Object { $_.Name -match '^\d+$' })
   if ($modelDirectories.Count -eq 0) { throw 'COLMAP mapper did not produce a sparse model directory.' }
-  # COLMAP may write model 1 (or another id) instead of always model 0.
-  # Prefer reconstructed 3D points, then registered-frame data. images.bin
-  # size is not a reliable image-count proxy because binary records vary.
-  $model = $modelDirectories |
-    Sort-Object `
-      @{ Expression = { $file = Join-Path $_.FullName 'points3D.bin'; if (Test-Path -LiteralPath $file) { (Get-Item -LiteralPath $file).Length } else { 0 } }; Descending = $true },
-      @{ Expression = { $file = Join-Path $_.FullName 'frames.bin'; if (Test-Path -LiteralPath $file) { (Get-Item -LiteralPath $file).Length } else { 0 } }; Descending = $true } |
-    Select-Object -First 1 |
-    Select-Object -ExpandProperty FullName
-
   $stage = 'sparse-quality'
-  $modelStats = Get-SparseModelStats $model $inspection
-  if ($null -eq $modelStats) {
-    throw "Unable to inspect sparse model '$model'. COLMAP model_converter did not produce images.txt and points3D.txt."
-  }
-  Write-Host "[sparse-quality] model $([System.IO.Path]::GetFileName($model)): $($modelStats.registeredImages) registered images, $($modelStats.sparsePoints) points"
+  $modelStats = $modelDirectories |
+    ForEach-Object { Get-SparseModelStats $_.FullName } |
+    Sort-Object `
+      @{ Expression = { $_.sparsePoints }; Descending = $true },
+      @{ Expression = { $_.registeredImages }; Descending = $true } |
+    Select-Object -First 1
+  $model = $modelStats.path
+  $qualityMessage = "[sparse-quality] model $([System.IO.Path]::GetFileName($model)): $($modelStats.registeredImages) registered images, $($modelStats.sparsePoints) points"
+  Write-Host $qualityMessage
+  Add-Content -LiteralPath $logPath -Value $qualityMessage -Encoding utf8
   if (-not $AllowSmallSparseModel -and ($modelStats.registeredImages -lt $MinRegisteredImages -or $modelStats.sparsePoints -lt $MinSparsePoints)) {
     throw "Sparse model is too small for dense reconstruction: $($modelStats.registeredImages) registered images and $($modelStats.sparsePoints) points. Need at least $MinRegisteredImages registered images and $MinSparsePoints points; capture more continuous, overlapping views, or pass -AllowSmallSparseModel to try dense anyway."
   }
@@ -222,7 +227,9 @@ try {
 } catch {
   $status = 'failed'
   $errors = @($_.Exception.Message)
-  Write-Warning "COLMAP reconstruction failed at ${stage}: $($_.Exception.Message)"
+  $failure = "COLMAP reconstruction failed at ${stage}: $($_.Exception.Message)"
+  Write-Warning $failure
+  Add-Content -LiteralPath $logPath -Value $failure -Encoding utf8
 }
 
 $finished = (Get-Date).ToUniversalTime().ToString('o')
@@ -233,6 +240,9 @@ $report = [ordered]@{
   startedAt = $started
   finishedAt = $finished
   totalImages = [int]$manifestImages.Count
+  colmapVersion = $colmapVersion
+  gpuBuild = $gpuBuild
+  logPath = $logPath
   sparseModel = if ($null -ne $model) { [System.IO.Path]::GetFileName($model) } else { $null }
   registeredImages = if ($null -ne $modelStats) { [int]$modelStats.registeredImages } else { $null }
   sparsePoints = if ($null -ne $modelStats) { [int]$modelStats.sparsePoints } else { $null }
@@ -240,5 +250,7 @@ $report = [ordered]@{
   warnings = @('COLMAP output is not a 3D Tiles tileset; convert and visually inspect it before loading in Cesium.')
 }
 $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding utf8
+Write-Host "Report: $reportPath"
+Write-Host "Log: $logPath"
 if ($status -ne 'succeeded') { exit 1 }
 Write-Host "Reconstruction finished. Report: $reportPath"
