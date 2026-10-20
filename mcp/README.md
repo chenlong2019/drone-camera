@@ -29,14 +29,22 @@ canvas 2D 整条渲染栈跑在浏览器里最保真,且 `tmp-shots/verify-*.mjs
 
 ## 1. 给 AI 用(MCP)
 
-`~/.workbuddy/mcp.json` 里加一段(本仓库已配好,首次使用需在连接器页面点「信任」):
+前置:克隆本仓库并装好依赖(驱动会按需拉起 vite + chromium,首次需下载浏览器)。
+
+```bash
+git clone https://github.com/chenlong2019/drone-camera && cd drone-camera
+npm install
+npx playwright install chromium
+```
+
+然后在 MCP 客户端配置里加一段(路径换成你本机的仓库绝对路径):
 
 ```json
 {
   "mcpServers": {
     "drone-camera": {
-      "command": "C:/Users/11746/.workbuddy/binaries/node/versions/22.22.2-6/node.exe",
-      "args": ["D:/project/drone-camera/mcp/drone-mcp-server.mjs"]
+      "command": "node",
+      "args": ["/absolute/path/to/drone-camera/mcp/drone-mcp-server.mjs"]
     }
   }
 }
