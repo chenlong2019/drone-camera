@@ -1,6 +1,6 @@
 {
   "name": "drone-camera",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "build-only": "vite build",
     "build:lib": "node scripts/build-lib.mjs",
     "pack:lib": "node scripts/build-lib.mjs && npm pack ./drone-camera",
+    "publish:lib": "node scripts/build-lib.mjs && npm publish ./drone-camera --access public",
     "type-check": "vue-tsc --build",
     "lint": "run-s \"lint:*\"",
     "lint:oxlint": "oxlint . --fix",

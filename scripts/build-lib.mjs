@@ -97,7 +97,16 @@ const declSrc = path.join(outDir, 'drone-camera')
 const declDst = path.join(outDir, 'lib')
 if (fs.existsSync(declSrc)) {
   fs.rmSync(declDst, { recursive: true, force: true })
-  fs.renameSync(declSrc, declDst)
+  // ⚠️ Windows 上本目录是 node_modules/drone-camera 软链的目标,TS 服务 / 编辑器索引
+  // 会短暂持有句柄,直接 rename 偶发 EPERM。退化为「复制 + 删除」即可绕开文件锁。
+  try {
+    fs.renameSync(declSrc, declDst)
+  } catch (err) {
+    if (err.code !== 'EPERM' && err.code !== 'EBUSY') throw err
+    log('  rename 被占用,退化为复制 + 删除')
+    fs.cpSync(declSrc, declDst, { recursive: true })
+    fs.rmSync(declSrc, { recursive: true, force: true })
+  }
   const entryDts = path.join(outDir, 'index.d.ts')
   fs.writeFileSync(
     entryDts,
@@ -175,6 +184,20 @@ const libPkg = {
   },
 }
 fs.writeFileSync(path.join(outDir, 'package.json'), `${JSON.stringify(libPkg, null, 2)}\n`, 'utf8')
+
+// ── 4.5 分发用的 README 与 LICENSE ─────────────────────────────────────────
+// npm 只会渲染「包内」的 README.md，而 GitHub 上能用的相对路径在这里全都失效：
+// 图片没随包发布、`./LICENSE` 也指不到仓库。故这里产出一份改写版 ——
+// 图片走 jsDelivr 上的仓库地址，链接指向 GitHub 仓库；仓库根目录仍保留相对路径版本。
+const repoSlug = 'chenlong2019/drone-camera'
+const repoRaw = `https://github.com/${repoSlug}/blob/main`
+const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8')
+const npmReadme = readme
+  .replaceAll('src="docs/images/', `src="https://cdn.jsdelivr.net/gh/${repoSlug}@main/docs/images/`)
+  .replaceAll('](./LICENSE)', `](${repoRaw}/LICENSE)`)
+  .replaceAll('](./README.zh-CN.md)', `](${repoRaw}/README.zh-CN.md)`)
+fs.writeFileSync(path.join(outDir, 'README.md'), npmReadme, 'utf8')
+fs.copyFileSync(path.join(root, 'LICENSE'), path.join(outDir, 'LICENSE'))
 
 // ── 5. 汇总 ────────────────────────────────────────────────────────────────
 log('\n产物：')

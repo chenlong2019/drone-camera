@@ -50,7 +50,7 @@ npm install -D @types/three
 import * as THREE from 'three'
 import { WebGPURenderer } from 'three/webgpu'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
-import { createDroneControl, DronePanel } from 'drone-camera'
+import { createDroneControl, DroneControlPanel } from 'drone-camera'
 
 const scene = new THREE.Scene()
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 4000)
@@ -64,7 +64,7 @@ const controls = new OrbitControls(camera, renderer.domElement)
 const drone = await createDroneControl({ engine: 'three', scene, camera, renderer, controls })
 
 // Native DOM panel: arm/takeoff/land, sticks, flight modes, camera views, photo & video.
-new DronePanel(drone)
+new DroneControlPanel(drone)
 
 renderer.setAnimationLoop(() => {
   drone.animate()
@@ -88,7 +88,7 @@ await loadCesiumScript('/Cesium/Cesium.js')
 // ENU/ECEF earth coordinates; origin altitude auto-sampled from terrain
 const drone = await createDroneControl({ engine: 'cesium', viewer, lon: 116.391, lat: 39.906 })
 
-// Same panels — DronePanel(drone) works unchanged.
+// Same panels — new DroneControlPanel(drone) works unchanged.
 ```
 
 ## Features
@@ -108,10 +108,12 @@ const drone = await createDroneControl({ engine: 'cesium', viewer, lon: 116.391,
 ## Panorama in three lines
 
 ```ts
-import { DronePanorama } from 'drone-camera'
+import { CaptureService, PanoramaCapture } from 'drone-camera'
 
-const pano = new DronePanorama(drone, { mode: 'sphere' }) // body spins; gimbal stacks pitch rows
-await pano.start()   // → shots land in the gallery → one-click stitch → spherical viewer
+const capture = new CaptureService({ provider: drone })   // drone = your engine host
+const session = capture.createSession({ source: 'virtual-camera', name: 'Around the tower' })
+const pano = new PanoramaCapture(capture)
+await pano.start(session.id, 'pano-360')   // body spins for yaw, gimbal stacks pitch rows
 ```
 
 Stitching exploits the fact that every shot's camera pose is known exactly — images are back-projected onto the equirectangular canvas, no feature matching or OpenCV involved.
@@ -139,7 +141,7 @@ The repo ships `mcp/drone-mcp-server.mjs` — a stdio MCP server exposing the ru
 
 ```
 ┌───────────────────────── UI (plain DOM, framework-free) ─────────────────────────┐
-│   DronePanel        MissionPanel        CapturePanel       MiniMap   Gallery   │
+│   DroneControlPanel  MissionPanel      CapturePanel       MiniMap   Gallery   │
 └──────────────────────────────────────┬───────────────────────────────────────────┘
                                        │ host interfaces (not inheritance)
 ┌──────────────────────────────────────┴───────────────────────────────────────────┐

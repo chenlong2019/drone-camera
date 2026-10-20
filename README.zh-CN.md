@@ -47,7 +47,7 @@ npm install -D @types/three
 import * as THREE from 'three'
 import { WebGPURenderer } from 'three/webgpu'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
-import { createDroneControl, DronePanel } from 'drone-camera'
+import { createDroneControl, DroneControlPanel } from 'drone-camera'
 
 const scene = new THREE.Scene()
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 4000)
@@ -61,7 +61,7 @@ const controls = new OrbitControls(camera, renderer.domElement)
 const drone = await createDroneControl({ engine: 'three', scene, camera, renderer, controls })
 
 // 原生 DOM 面板:上电/起飞/降落、摇杆、飞行模式、视角切换、拍照/录像。
-new DronePanel(drone)
+new DroneControlPanel(drone)
 
 renderer.setAnimationLoop(() => {
   drone.animate()
@@ -85,7 +85,7 @@ await loadCesiumScript('/Cesium/Cesium.js')
 // ENU/ECEF 地球坐标;锚点海拔自动采样地形
 const drone = await createDroneControl({ engine: 'cesium', viewer, lon: 116.391, lat: 39.906 })
 
-// 同一套面板 —— DronePanel(drone) 一字不改。
+// 同一套面板 —— new DroneControlPanel(drone) 一字不改。
 ```
 
 ## 功能
@@ -105,10 +105,12 @@ const drone = await createDroneControl({ engine: 'cesium', viewer, lon: 116.391,
 ## 全景三行接入
 
 ```ts
-import { DronePanorama } from 'drone-camera'
+import { CaptureService, PanoramaCapture } from 'drone-camera'
 
-const pano = new DronePanorama(drone, { mode: 'sphere' }) // 机体自转补水平视野,云台做俯仰分层
-await pano.start()   // → 影像入集 → 一键合成 → 球面环视
+const capture = new CaptureService({ provider: drone })   // drone = 你的引擎实例
+const session = capture.createSession({ source: 'virtual-camera', name: '绕塔一圈' })
+const pano = new PanoramaCapture(capture)
+await pano.start(session.id, 'pano-360')   // 机体自转补水平视野,云台做俯仰分层
 ```
 
 拼接利用了这条链路的免费红利:**每张照片的取景位姿是精确已知的**,直接反投影到等距柱状画布即可 —— 不需要特征匹配,也不需要 OpenCV。
@@ -136,7 +138,7 @@ npm run dev          # → /three-demo  /cesium-demo  /docs  /api-docs
 
 ```
 ┌───────────────────────── UI(原生 DOM,与框架无关)─────────────────────────────┐
-│   DronePanel        MissionPanel        CapturePanel       MiniMap   Gallery │
+│   DroneControlPanel  MissionPanel      CapturePanel       MiniMap   Gallery │
 └──────────────────────────────────────┬────────────────────────────────────────┘
                                        │ 宿主接口(组合,非继承)
 ┌──────────────────────────────────────┴────────────────────────────────────────┐
