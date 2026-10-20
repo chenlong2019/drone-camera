@@ -30,7 +30,7 @@ const GLB_MODEL_URL = assetUrl('models/dji_mini4_pro.glb')
  * 但户外场景的天空方向、色温、地平线全是假的,材质再对也像塑料。这里只在加载失败时兜底。
  * `?hdri=0` 可退回旧的中性环境,便于对比。
  */
-const HDRI_URL = assetUrl('hdri/spruit_sunrise_4k.hdr')
+const HDRI_URL = assetUrl('hdri/spruit_sunrise_2k.hdr')
 
 /**
  * 太阳方位:由 HDRI 最亮区域实测反推(tmp-shots/find-sun-page.mjs)——
@@ -176,7 +176,7 @@ export class UseThreeDemo {
     this.renderer.toneMappingExposure = 1.0
 
     // 先给中性影棚底光,保证首帧金属机体就有正确反射;
-    // 再异步升级到真实户外 HDRI(24MB,不阻塞首帧,加载完自动替换)。
+    // 再异步升级到真实户外 HDRI(2k 8MB,不阻塞首帧,加载完自动替换)。
     this.applyFallbackEnvironment()
     void this.applyHdriEnvironment()
 

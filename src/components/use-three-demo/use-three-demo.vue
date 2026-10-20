@@ -24,6 +24,11 @@
       <span class="ms-hint">使用说明</span>
     </button>
     <p v-if="error" class="ms-error">{{ error }}</p>
+    <!-- 首帧加载覆盖层:机体 GLB(约14MB)下载完成前 canvas 没有画面,给一个明确的等待提示 -->
+    <div v-if="loading" class="ms-boot">
+      <span class="boot-ring"></span>
+      <span class="boot-text">正在加载机体模型,首次访问约需 10~30 秒…</span>
+    </div>
   </div>
 </template>
 <script setup lang="ts">
@@ -39,6 +44,7 @@ let libDemo: UseThreeDemo | null = null
 const body = ref<'husky' | 'glb'>('glb')
 const switching = ref(false)
 const error = ref('')
+const loading = ref(true)
 
 onMounted(async () => {
   if (!viewerRef.value) return
@@ -46,7 +52,11 @@ onMounted(async () => {
   libDemo.onBodyChange = (kind) => {
     body.value = kind
   }
-  await libDemo.init()
+  try {
+    await libDemo.init()
+  } finally {
+    loading.value = false
+  }
   // init 里会按 ?model=husky 决定初始机体,同步到按钮文案
   body.value = libDemo.currentBody
   // 文档页「打开 360° 全景」带 ?pano=1 跳过来:自动展开全景弹窗,免得用户再点一次
@@ -249,5 +259,44 @@ onUnmounted(() => {
     'Segoe UI',
     'Microsoft YaHei',
     sans-serif;
+}
+
+.ms-boot {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: radial-gradient(ellipse at 50% 42%, #1b2030 0%, #0d1018 70%);
+  color: #cfd8e3;
+  font:
+    500 13px/1.6 system-ui,
+    -apple-system,
+    'Segoe UI',
+    'Microsoft YaHei',
+    sans-serif;
+
+  .boot-ring {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 3px solid rgba(53, 192, 255, 0.22);
+    border-top-color: #35c0ff;
+    animation: boot-spin 0.9s linear infinite;
+  }
+
+  .boot-text {
+    opacity: 0.82;
+    letter-spacing: 0.02em;
+  }
+}
+
+@keyframes boot-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 </style>

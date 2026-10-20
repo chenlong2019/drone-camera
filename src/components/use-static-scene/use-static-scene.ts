@@ -16,7 +16,7 @@ import { StaticScene } from './static-scene'
 import type { StaticSceneStats } from './static-scene'
 import { assetUrl } from '@/utils/asset-url'
 
-const HDRI_URL = assetUrl('hdri/spruit_sunrise_4k.hdr')
+const HDRI_URL = assetUrl('hdri/spruit_sunrise_2k.hdr')
 
 /**
  * 太阳方向：与 HDRI 里的太阳一致（方位 36.6° / 仰角 8.4°，由像素亮度反推）。
