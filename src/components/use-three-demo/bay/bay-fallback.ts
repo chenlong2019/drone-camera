@@ -9,7 +9,8 @@
  */
 import * as THREE from 'three'
 import { RIPPLE_TILE, createRippleTexture } from './ripple-texture'
-import type { SkyDome, WaterOptions, WaterSurface } from './bay-water'
+import type { SkyDome } from './bay-sky'
+import type { WaterOptions, WaterSurface } from './bay-water'
 
 /** 坡度 DataTexture → 8-bit 法线贴图:n = normalize(-dh/dx, 1, -dh/dy) */
 function rippleToNormalMap(): THREE.DataTexture {
@@ -18,8 +19,8 @@ function rippleToNormalMap(): THREE.DataTexture {
   const src = slope.image.data as Float32Array
   const data = new Uint8Array(size * size * 4)
   for (let i = 0; i < size * size; i += 1) {
-    const sx = src[i * 4]
-    const sy = src[i * 4 + 1]
+    const sx = src[i * 4]!
+    const sy = src[i * 4 + 1]!
     // 梯度量级 ~O(1),直接归一化;轻微增强凹凸感
     const inv = 1 / Math.hypot(sx * 1.6, sy * 1.6, 1)
     data[i * 4] = Math.round((-sx * 1.6 * inv * 0.5 + 0.5) * 255)
@@ -72,7 +73,7 @@ export function createFallbackSkyDome(radius: number): SkyDome {
     update() {
       /* 静态渐变,没有云层动画 */
     },
-    follow(eye) {
+    follow(eye: THREE.Vector3) {
       mesh.position.copy(eye)
     },
     dispose() {

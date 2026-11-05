@@ -24,6 +24,14 @@ export type DroneRendererKind = 'webgpu' | 'webgl'
 export interface DroneRendererLike {
   readonly domElement: HTMLCanvasElement
   render(scene: THREE.Scene, camera: THREE.Camera): void
+  /** WebGPURenderer 专属(异步初始化后端);WebGLRenderer 没有,使用方需自行判别 */
+  init?(): Promise<unknown>
+  setSize(width: number, height: number, updateStyle?: boolean): void
+  /** WebGPU 与传统 WebGL 渲染器都有该对象;WebGPU 下仅 forceWebGL 后端真正消费阴影配置 */
+  shadowMap: { enabled: boolean; type: number }
+  toneMapping: number
+  toneMappingExposure: number
+  dispose(): void
 }
 
 /**

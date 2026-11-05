@@ -108,22 +108,22 @@ export function createPolylineCentreline(points: readonly Point2[], closed = tru
   if (points.length < 2) throw new RangeError('a centreline needs at least two points')
   const vertices = points.map(([x, z]) => new THREE.Vector3(x, 0, z))
   // 闭合折线在末尾补回首点，使其成为可循环的 length 段闭环。
-  if (closed) vertices.push(vertices[0].clone())
+  if (closed) vertices.push(vertices[0]!.clone())
   const segments = vertices.length - 1
   const cumulative = [0]
   for (let i = 0; i < segments; i++)
-    cumulative.push(cumulative[i] + vertices[i].distanceTo(vertices[i + 1]))
-  const length = cumulative[segments]
+    cumulative.push(cumulative[i]! + vertices[i]!.distanceTo(vertices[i + 1]!))
+  const length = cumulative[segments]!
 
   // Smooth per-vertex heading, taken from the neighbouring points so the frame
   // does not jump at every segment boundary.
   const headings: number[] = []
   for (let i = 0; i < vertices.length; i++) {
-    const before = vertices[Math.max(0, i - 1)]
-    const after = vertices[Math.min(vertices.length - 1, i + 1)]
+    const before = vertices[Math.max(0, i - 1)]!
+    const after = vertices[Math.min(vertices.length - 1, i + 1)]!
     headings.push(Math.atan2(after.x - before.x, after.z - before.z))
   }
-  if (closed) headings[vertices.length - 1] = headings[0]
+  if (closed) headings[vertices.length - 1] = headings[0]!
 
   const frameAtDistance = (distance: number): CentrelineFrame => {
     // 闭合时把弧长映射回 [0, length)，兼容负距离的双向取模。
@@ -134,13 +134,13 @@ export function createPolylineCentreline(points: readonly Point2[], closed = tru
     let high = segments - 1
     while (low < high) {
       const mid = (low + high + 1) >> 1
-      if (cumulative[mid] <= d) low = mid
+      if (cumulative[mid]! <= d) low = mid
       else high = mid - 1
     }
-    const span = cumulative[low + 1] - cumulative[low]
-    const t = span > 0 ? (d - cumulative[low]) / span : 0
-    const position = vertices[low].clone().lerp(vertices[low + 1], t)
-    const heading = headings[low] + angleDelta(headings[low], headings[low + 1]) * t
+    const span = cumulative[low + 1]! - cumulative[low]!
+    const t = span > 0 ? (d - cumulative[low]!) / span : 0
+    const position = vertices[low]!.clone().lerp(vertices[low + 1]!, t)
+    const heading = headings[low]! + angleDelta(headings[low]!, headings[low + 1]!) * t
     const forward = new THREE.Vector3(Math.sin(heading), 0, Math.cos(heading))
     const lateral = new THREE.Vector3(-Math.cos(heading), 0, Math.sin(heading))
     return { position, forward, lateral, heading, yaw: -Math.atan2(forward.z, forward.x) }
@@ -150,8 +150,8 @@ export function createPolylineCentreline(points: readonly Point2[], closed = tru
     let bestDistance = 0
     let bestSquared = Infinity
     for (let i = 0; i < segments; i++) {
-      const a = vertices[i]
-      const b = vertices[i + 1]
+      const a = vertices[i]!
+      const b = vertices[i + 1]!
       const abx = b.x - a.x
       const abz = b.z - a.z
       const lengthSquared = abx * abx + abz * abz
@@ -162,7 +162,7 @@ export function createPolylineCentreline(points: readonly Point2[], closed = tru
       const squared = dx * dx + dz * dz
       if (squared < bestSquared) {
         bestSquared = squared
-        bestDistance = cumulative[i] + t * Math.sqrt(lengthSquared)
+        bestDistance = cumulative[i]! + t * Math.sqrt(lengthSquared)
       }
     }
     const frame = frameAtDistance(bestDistance)

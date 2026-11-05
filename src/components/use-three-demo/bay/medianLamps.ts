@@ -101,8 +101,8 @@ export function createMedianLamps(options: MedianLampOptions): MedianLampGroup {
       .map((pair, index) => ({
         index,
         distance: Math.hypot(
-          pair[0].position.x - viewerLocal.x,
-          pair[0].position.z - viewerLocal.z,
+          pair[0]!.position.x - viewerLocal.x,
+          pair[0]!.position.z - viewerLocal.z,
         ),
       }))
       .sort((a, b) => a.distance - b.distance)
@@ -114,7 +114,7 @@ export function createMedianLamps(options: MedianLampOptions): MedianLampGroup {
         light.intensity = 0
         return
       }
-      const anchor = anchors[entry.index][index % 2]
+      const anchor = anchors[entry.index]![index % 2]!
       light.position.copy(anchor.position)
       light.target.position.copy(anchor.target)
       // 距离在“灯高×5”到“灯高×7.5”之间用 smoothstep 淡出，避免远处路灯突然熄灭。

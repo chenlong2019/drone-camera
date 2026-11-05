@@ -128,6 +128,7 @@ const snapshot = ref<AmapDemoSnapshot>({
   local: { x: 0, y: 0, z: 0 },
   altitude: 0,
   heading: 0,
+  gimbalPitch: 0,
   phase: 'powerOff',
   airborne: false,
   map: null,

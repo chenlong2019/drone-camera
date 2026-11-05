@@ -24,8 +24,8 @@ export class SweepBuilder {
 
   add(frames: CentrelineFrame[], profile: readonly Point[], closed: boolean): this {
     const edges: [Point, Point][] = []
-    for (let j = 0; j < profile.length - 1; j++) edges.push([profile[j], profile[j + 1]])
-    if (closed) edges.push([profile[profile.length - 1], profile[0]])
+    for (let j = 0; j < profile.length - 1; j++) edges.push([profile[j]!, profile[j + 1]!])
+    if (closed) edges.push([profile[profile.length - 1]!, profile[0]!])
     for (const [a, b] of edges) {
       const base = this.positions.length / 3
       for (const frame of frames) {
@@ -50,7 +50,7 @@ export class SweepBuilder {
       [0, false],
       [frames.length - 1, true],
     ] as [number, boolean][]) {
-      const frame = frames[index]
+      const frame = frames[index]!
       const base = this.positions.length / 3
       for (const [u, y] of profile) {
         this.positions.push(

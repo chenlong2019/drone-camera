@@ -74,9 +74,9 @@ const swellField = Fn(([p]: any) => {
   const s2 = swell(-0.17, 0.43, 0.037, t.mul(float(0.37).add(wind.mul(0.16))).negate().add(1.7))
   const s3 = swell(0.91, -0.67, 0.017, t.mul(float(0.29).add(wind.mul(0.11))).add(2.4))
   const s4 = swell(-1.37, -0.21, 0.009, t.mul(0.19).negate().add(4.1))
-  return vec3(
-    s1.h.add(s2.h).add(s3.h).add(s4.h).mul(intensity),
-    s1.g.add(s2.g).add(s3.g).add(s4.g).mul(intensity),
+  return vec2(
+    s1.h.add(s2.h).add(s3.h).add(s4.h).mul(intensity) as any,
+    s1.g.add(s2.g).add(s3.g).add(s4.g).mul(intensity) as any,
   )
 }) as any
 

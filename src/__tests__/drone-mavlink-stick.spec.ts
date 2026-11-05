@@ -19,7 +19,7 @@ describe('外部接管下的摇杆转发', () => {
 
     expect(stick).toHaveBeenCalledTimes(1)
     // 传的是合并后的完整行程,不是那一帧的增量
-    expect(stick.mock.calls[0][0]).toEqual({ throttle: 0, yaw: 0, pitch: 0.5, roll: 0 })
+    expect(stick.mock.calls[0]![0]).toEqual({ throttle: 0, yaw: 0, pitch: 0.5, roll: 0 })
   })
 
   it('多次 setStick 每次都转发(外部源自己负责节流)', () => {
@@ -31,7 +31,7 @@ describe('外部接管下的摇杆转发', () => {
     sim.setStick({ roll: -1 })
 
     expect(stick).toHaveBeenCalledTimes(2)
-    expect(stick.mock.calls[1][0]).toMatchObject({ pitch: 1, roll: -1 })
+    expect(stick.mock.calls[1]![0]).toMatchObject({ pitch: 1, roll: -1 })
   })
 
   it('外部源没有 stick 能力时(只读回放源)不报错', () => {

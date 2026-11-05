@@ -82,7 +82,7 @@ const fbm = Fn(([p]: any) => {
  * 海面按反射方向调用本函数,所以海天线、云影与高光天然对得上。
  */
 export const skyColorNode = Fn(([dir]: any) => {
-  const d = normalize(dir)
+  const d = normalize(dir) as any
   const height = max(d.y, 0)
   const sunDir = normalize(vec3(0.3, max(float(0.12), skySunHeight), -0.76))
   const alignment = max(dot(d, sunDir), 0)
@@ -152,8 +152,8 @@ export const skyColorNode = Fn(([dir]: any) => {
     mix(vec3(0.6), vec3(0.55, 0.62, 0.8), skyNight)
       .mul(pow(alignment, 320))
       .mul(mix(float(1), float(0.5), skyNight)),
-  )
-  col = col.add(mix(vec3(2.0), vec3(1.4, 1.5, 1.8), skyNight).mul(pow(alignment, 6000)))
+  ) as any
+  col = col.add(mix(vec3(2.0), vec3(1.4, 1.5, 1.8), skyNight).mul(pow(alignment, 6000))) as any
   return col
 }) as any
 

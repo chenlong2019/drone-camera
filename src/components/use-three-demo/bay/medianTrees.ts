@@ -131,7 +131,7 @@ export function createMedianTrees(options: MedianTreeOptions): THREE.Group {
         report.batches++
       }
       report.triangles +=
-        ((geometry.index?.count ?? geometry.attributes.position.count) / 3) * stations.length
+        ((geometry.index?.count ?? geometry.attributes.position!.count) / 3) * stations.length
       mesh.geometry.dispose()
       originals.forEach((material) => material.dispose())
     })

@@ -1,5 +1,5 @@
 import { AmapDroneAdapter, AmapDroneMap, DroneControlPanel, DroneSim, gcj02OffsetMeters } from '@/lib'
-import type { AmapMapState, CameraMode } from '@/lib'
+import type { AmapMapInstance, AmapMapState, CameraMode } from '@/lib'
 
 /** 高德 web 端 key / 安全密钥(构建期注入;缺 key 时页面给出可读提示而不是白屏) */
 const AMAP_KEY = (import.meta.env.VITE_AMAP_KEY ?? '').trim()
@@ -49,6 +49,8 @@ export interface AmapDemoApi {
   setCameraMode(mode: CameraMode): void
   /** 当前视角模式 */
   getCameraMode(): CameraMode
+  /** 底层 AMap.Map 实例(验证脚本做覆盖物对照实验用) */
+  rawMap(): AmapMapInstance | null
 }
 
 /**

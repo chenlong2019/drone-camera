@@ -548,12 +548,13 @@ export class UseThreeDemo {
     this.rendererKind =
       (new URLSearchParams(window.location.search).get('renderer') as DroneRendererKind) ?? 'webgpu'
     const postPipeline = this.rendererKind !== 'webgl'
+    let renderer: DroneRendererLike
     if (postPipeline) {
-      this.renderer = new WebGPURenderer({ antialias: true })
-      await this.renderer.init()
+      const gpu = new WebGPURenderer({ antialias: true })
+      await gpu.init()
       // 卡顿排查第一现场:真在硬件上跑还是掉进了软件渲染(SwiftShader),一眼可见
       try {
-        const info = (this.renderer as unknown as { backend?: { device?: { adapterInfo?: GPUAdapterInfo | null } } })
+        const info = (gpu as unknown as { backend?: { device?: { adapterInfo?: GPUAdapterInfo | null } } })
           .backend?.device?.adapterInfo
         if (info) {
           console.info(
@@ -563,15 +564,17 @@ export class UseThreeDemo {
       } catch {
         // adapterInfo 拿不到就算了,不影响渲染
       }
+      renderer = gpu
     } else {
       const gl = new THREE.WebGLRenderer({ antialias: true })
       gl.toneMapping = THREE.ACESFilmicToneMapping
-      this.renderer = gl
+      renderer = gl
     }
-    this.rendererKind = rendererKindOf(this.renderer)
-    this.renderer.setSize(width, height)
-    this.renderer.shadowMap.enabled = true
-    this.container.appendChild(this.renderer.domElement)
+    this.renderer = renderer
+    this.rendererKind = rendererKindOf(renderer)
+    renderer.setSize(width, height)
+    renderer.shadowMap.enabled = true
+    this.container.appendChild(renderer.domElement)
 
     // 场景内容层:demo 自己用 three 搭的布景,与库的沙盒骨架(底板 + 网格 + 返航点)完全解耦。
     // 默认是 firstapp「海湾竞速」的静态部分(天空 + 海面 + 跨海大桥);
@@ -588,7 +591,7 @@ export class UseThreeDemo {
     }
 
     // 轨道控制器
-    this.controls = new OrbitControls(this.camera, this.renderer.domElement)
+    this.controls = new OrbitControls(this.camera, renderer.domElement)
     this.controls.enableDamping = true
     this.controls.dampingFactor = 0.05
 
@@ -613,8 +616,8 @@ export class UseThreeDemo {
     this.scene.add(dirLight)
     this.dirLight = dirLight
 
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping
-    this.renderer.toneMappingExposure = 1.0
+    renderer.toneMapping = THREE.ACESFilmicToneMapping
+    renderer.toneMappingExposure = 1.0
 
     // 先给中性影棚底光,保证首帧金属机体就有正确反射;
     // 再异步升级到真实户外 HDRI(2k 8MB,不阻塞首帧,加载完自动替换)。
@@ -629,7 +632,7 @@ export class UseThreeDemo {
       const scenePass = pass(this.scene, this.camera)
       const sceneColor = scenePass.getTextureNode()
       this.bloomPass = bloom(sceneColor, BLOOM_STRENGTH, BLOOM_RADIUS, BLOOM_THRESHOLD)
-      this.postProcessing = new PostProcessing(this.renderer as WebGPURenderer)
+      this.postProcessing = new PostProcessing(this.renderer as unknown as WebGPURenderer)
       this.postProcessing.outputNode = sceneColor.add(this.bloomPass)
     }
 
@@ -748,7 +751,7 @@ export class UseThreeDemo {
     // three/webgpu 的 PMREM 只认 WebGPURenderer;传统 WebGLRenderer 用 three 的同名类
     const pmrem =
       this.rendererKind === 'webgpu'
-        ? new WGPUPMREMGenerator(renderer as WebGPURenderer)
+        ? new WGPUPMREMGenerator(renderer as unknown as WebGPURenderer)
         : new WebGLPMREMGenerator(renderer as unknown as THREE.WebGLRenderer)
     const room = new RoomEnvironment()
     scene.environment = pmrem.fromScene(room, 0.04).texture

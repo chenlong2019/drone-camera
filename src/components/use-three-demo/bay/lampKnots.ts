@@ -60,26 +60,26 @@ export function createLampKnots(options: MedianLampOptions, stations: number[]):
     for (const entry of entries) {
       const distance = entry.position.distanceTo(viewer)
       let level =
-        distance < thresholds[0]
+        distance < thresholds[0]!
           ? 0
-          : distance < thresholds[1]
+          : distance < thresholds[1]!
             ? 1
-            : distance < thresholds[2]
+            : distance < thresholds[2]!
               ? 2
               : 3
       // Hysteresis prevents repeated switches at the same distance while orbiting.
-      if (level > entry.lod && distance < thresholds[entry.lod] * 1.08) level = entry.lod
-      if (level < entry.lod && distance > thresholds[level] * 0.92) level = entry.lod
+      if (level > entry.lod && distance < thresholds[entry.lod]! * 1.08) level = entry.lod
+      if (level < entry.lod && distance > thresholds[level]! * 0.92) level = entry.lod
       entry.lod = level
       if (level === 3) continue
-      levels[level].setMatrixAt(counts[level]++, entry.knot)
+      levels[level]!.setMatrixAt(counts[level]!++, entry.knot)
       brackets!.setMatrixAt(bracketCount++, entry.bracket)
     }
     report.lodCounts = counts
     report.culled = entries.length - bracketCount
     report.submittedTriangles = 0
     ;[...levels, brackets!].forEach((batch, index) => {
-      batch.count = index < 3 ? counts[index] : bracketCount
+      batch.count = index < 3 ? (counts[index] ?? 0) : bracketCount
       batch.visible = batch.count > 0
       batch.instanceMatrix.needsUpdate = true
       batch.computeBoundingBox()
@@ -90,7 +90,8 @@ export function createLampKnots(options: MedianLampOptions, stations: number[]):
         batch.boundingSphere!.radius += report.height * 0.08
       }
       report.submittedTriangles +=
-        (batch.count * (batch.geometry.index?.count ?? batch.geometry.attributes.position.count)) /
+        (batch.count *
+          (batch.geometry.index?.count ?? batch.geometry.attributes.position!.count)) /
         3
     })
   }
@@ -108,7 +109,7 @@ export function createLampKnots(options: MedianLampOptions, stations: number[]):
         if (!mesh?.isMesh) throw new Error('Prepared Chinese knot mesh is missing')
         return mesh
       })
-      const material = (meshes[0].material as THREE.MeshStandardMaterial).clone()
+      const material = (meshes[0]!.material as THREE.MeshStandardMaterial).clone()
       material.roughness = 0.62
       // Preserve coloured thread beneath nearby spotlights, not glowing tinsel.
       material.onBeforeCompile = (shader) => {
@@ -120,9 +121,9 @@ export function createLampKnots(options: MedianLampOptions, stations: number[]):
       }
       motion.apply(material, true)
       const capacity = stations.length * 2
-      meshes[0].geometry.computeBoundingBox()
+      meshes[0]!.geometry.computeBoundingBox()
       // One common attachment origin across LODs: changing detail cannot move a knot.
-      const top = meshes[0].geometry.boundingBox!.max.y
+      const top = meshes[0]!.geometry.boundingBox!.max.y
       meshes.forEach((mesh, index) => {
         const geometry = mesh.geometry.clone().applyMatrix4(mesh.matrixWorld)
         geometry.translate(0, -top, 0)
@@ -184,7 +185,7 @@ export function createLampKnots(options: MedianLampOptions, stations: number[]):
         id: `station.${Math.floor(i / 2)}.knot.${i % 2 === 0 ? 'left' : 'right'}`,
         kind: 'decoration',
         matrix: entry.knot.clone(),
-        bounds: levels[0].geometry.boundingBox!.clone().expandByScalar(0.08),
+        bounds: levels[0]!.geometry.boundingBox!.clone().expandByScalar(0.08),
       }))
     })
     .catch((error) => {
