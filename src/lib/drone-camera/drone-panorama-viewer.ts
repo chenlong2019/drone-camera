@@ -55,6 +55,14 @@ export interface DronePanoramaViewerOptions {
    * 影像集弹窗里已有自己的入口,那里不需要;独立打开的查看器(比如 demo 页的按钮)开着才方便。
    */
   importable?: boolean
+  /**
+   * 内嵌模式:传一个定位过的容器(通常 `position:relative`),查看器就挂进它填满容器,
+   * 而不是弹全屏弹窗 —— 示例页整页环视用的就是这条路径。样式/交互与弹窗一致,
+   * 但没有遮罩与标题栏,键盘只在该容器聚焦时生效(不拦截页面其它快捷键),也不锁页面滚动。
+   */
+  inline?: HTMLElement
+  /** 自动旋转速率(度/秒,向右);用户拖动 / 滚轮后停止。默认 0 不旋转 */
+  autoRotateDegPerSec?: number
   /** 关闭回调(点 × / 点遮罩 / Esc) */
   onClose?: () => void
 }
@@ -250,6 +258,25 @@ const VIEWER_CSS = `
   flex: 0 0 auto; padding: 6px 10px; border-top: 1px solid var(--divp-border);
   color: var(--divp-muted); font-size: 11px;
 }
+/* 内嵌模式:填满宿主给的容器,没有遮罩/标题栏;HUD 与操作钮改成浮层 */
+.divp-inline {
+  position: absolute; inset: 0; z-index: auto; padding: 0;
+}
+.divp-inline .divp-frame {
+  width: 100%; border: 0; border-radius: 0; background: transparent; box-shadow: none;
+}
+.divp-inline .divp-stage { border-radius: 0; }
+.divp-hud-float {
+  position: absolute; left: 10px; bottom: 10px; padding: 4px 10px; pointer-events: none;
+  border-radius: 8px; background: rgba(6, 10, 16, 0.62);
+  color: var(--divp-text); font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.divp-inline-actions {
+  position: absolute; right: 10px; top: 10px; display: flex; gap: 6px;
+}
+.divp-inline-actions .divp-btn {
+  background: rgba(6, 10, 16, 0.62);
+}
 @media (pointer: coarse) {
   .divp-icon { width: 32px; height: 32px; }
   .divp-btn { min-height: 32px; }
@@ -315,6 +342,12 @@ function normalizeDeg(value: number): number {
  */
 export class DronePanoramaViewer {
   private readonly options: DronePanoramaViewerOptions
+  /** 内嵌模式的宿主容器(弹窗模式为 null) */
+  private readonly inline: HTMLElement | null
+  /** 自动旋转速率(度/秒);用户一拖就停 */
+  private readonly autoSpin: number
+  /** 自动旋转是否还开着(用户交互后置 false) */
+  private autoSpinActive = true
   private readonly minFov: number
   private readonly maxFov: number
   private root: HTMLDivElement | null = null
@@ -343,12 +376,16 @@ export class DronePanoramaViewer {
   private pinchDistance = 0
   private rafId = 0
   private dirty = true
+  /** 自动旋转的帧间计时(onFrame 里算 dt 用) */
+  private lastFrameTime = 0
   private bodyOverflow = ''
   private destroyed = false
 
   /** 构造球面全景查看器(手写 WebGL 零依赖;可传初始角与导入开关) */
   constructor(options: DronePanoramaViewerOptions = {}) {
     this.options = options
+    this.inline = options.inline ?? null
+    this.autoSpin = Number.isFinite(options.autoRotateDegPerSec) ? (options.autoRotateDegPerSec as number) : 0
     this.minFov = resolveFov(options.minFovDeg ?? DEFAULT_MIN_FOV_DEG, 5, 170, DEFAULT_MIN_FOV_DEG)
     this.maxFov = resolveFov(options.maxFovDeg ?? DEFAULT_MAX_FOV_DEG, this.minFov, 170, DEFAULT_MAX_FOV_DEG)
     this.yaw = options.initialYawDeg ?? 0
@@ -460,20 +497,22 @@ export class DronePanoramaViewer {
     if (this.options.injectStyles !== false) ensureStyles()
 
     const root = document.createElement('div')
-    root.className = 'divp'
+    root.className = this.inline ? 'divp divp-inline' : 'divp'
     root.hidden = true
     root.tabIndex = -1
     root.setAttribute('role', 'dialog')
-    root.setAttribute('aria-modal', 'true')
+    root.setAttribute('aria-modal', this.inline ? 'false' : 'true')
     root.setAttribute('aria-label', '全景查看')
-    if (this.options.zIndex && this.options.zIndex !== DEFAULT_Z_INDEX) {
+    if (!this.inline && this.options.zIndex && this.options.zIndex !== DEFAULT_Z_INDEX) {
       root.style.zIndex = String(this.options.zIndex)
     }
     root.innerHTML = this.template()
-    document.body.appendChild(root)
+    // 内嵌 = 挂进宿主容器;弹窗 = 挂 body(面板 backdrop-filter 会换包含块,见头注释 3)
+    ;(this.inline ?? document.body).appendChild(root)
     this.root = root
     this.refs = {
-      mask: this.query('[data-role="mask"]'),
+      // 内嵌模式没有遮罩节点:占位用 root 本身(点击关闭的逻辑按模式跳过)
+      mask: this.inline ? root : this.query('[data-role="mask"]'),
       stage: this.query('[data-role="stage"]'),
       canvas: this.query<HTMLCanvasElement>('[data-role="canvas"]'),
       title: this.query('[data-role="title"]'),
@@ -492,8 +531,13 @@ export class DronePanoramaViewer {
     stage.addEventListener('pointercancel', this.onPointerUp)
     stage.addEventListener('wheel', this.onWheel, { passive: false })
     stage.addEventListener('dblclick', this.onDoubleClick)
-    // 捕获阶段接管键盘,才能压住面板挂在冒泡阶段的键盘飞行(见模块头注释 3)
-    window.addEventListener('keydown', this.onKeyDown, { capture: true })
+    // 弹窗:捕获阶段接管键盘,压住面板挂在冒泡阶段的键盘飞行(见模块头注释 3);
+    // 内嵌:键盘挂容器自身,只有容器聚焦(点过画面)才响应,不抢页面其它快捷键。
+    if (this.inline) {
+      root.addEventListener('keydown', this.onKeyDown)
+    } else {
+      window.addEventListener('keydown', this.onKeyDown, { capture: true })
+    }
 
     const gl = this.createContext()
     if (!gl) {
@@ -507,7 +551,11 @@ export class DronePanoramaViewer {
   }
 
   private unmount(): void {
-    window.removeEventListener('keydown', this.onKeyDown, { capture: true })
+    if (this.inline) {
+      this.root?.removeEventListener('keydown', this.onKeyDown)
+    } else {
+      window.removeEventListener('keydown', this.onKeyDown, { capture: true })
+    }
     if (this.rafId) {
       window.cancelAnimationFrame(this.rafId)
       this.rafId = 0
@@ -724,6 +772,16 @@ export class DronePanoramaViewer {
 
   private readonly onFrame = (): void => {
     this.rafId = 0
+    // 自动旋转:每帧按 dt 推进方位角;用户一交互(onPointerDown / onWheel)就永久停下
+    const now = performance.now()
+    if (this.autoSpin && this.autoSpinActive && this.pointers.size === 0) {
+      const dt = this.lastFrameTime ? Math.min((now - this.lastFrameTime) / 1000, 0.1) : 0
+      if (dt > 0) {
+        this.yaw += this.autoSpin * dt
+        this.dirty = true
+      }
+    }
+    this.lastFrameTime = now
     const v = this.velocity
     if (Math.abs(v.yaw) > INERTIA_MIN || Math.abs(v.pitch) > INERTIA_MIN) {
       this.yaw += v.yaw
@@ -739,6 +797,8 @@ export class DronePanoramaViewer {
     if (!this.dirty) return
     this.dirty = false
     this.draw()
+    // 开着自动旋转就持续排帧(不需要时 autoSpin=0,行为与从前逐字节一致)
+    if (this.autoSpin) this.schedule()
   }
 
   private draw(): void {
@@ -810,13 +870,15 @@ export class DronePanoramaViewer {
       default:
         break
     }
-    // 只有点遮罩(而不是画面)才关,免得想细看的人一拖就被弹出去
-    if (target === this.root || target === this.refs?.mask) this.close()
+    // 只有点遮罩(而不是画面)才关,免得想细看的人一拖就被弹出去;内嵌模式没有遮罩,永不误关
+    if (!this.inline && (target === this.root || target === this.refs?.mask)) this.close()
   }
 
   private readonly onPointerDown = (event: PointerEvent): void => {
     const target = event.target as HTMLElement | null
     if (target?.closest('[data-action]')) return
+    // 用户上手了,自动旋转就别再抢镜头
+    this.autoSpinActive = false
     this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
     try {
       this.refs?.stage.setPointerCapture(event.pointerId)
@@ -878,6 +940,7 @@ export class DronePanoramaViewer {
     event.preventDefault()
     this.velocity.yaw = 0
     this.velocity.pitch = 0
+    this.autoSpinActive = false
     // 向上滚(deltaY < 0)= 视野收窄 = 放大;指数映射让每一格滚轮的"倍率"恒定
     this.zoomBy(Math.exp(event.deltaY * WHEEL_ZOOM_RATE))
   }
@@ -894,6 +957,8 @@ export class DronePanoramaViewer {
     const step = event.shiftKey ? 15 : 5
     switch (event.key) {
       case 'Escape':
+        // 内嵌在页面里时 Esc 不关闭 —— 没有弹窗语义,关掉页面就空了
+        if (this.inline) break
         event.preventDefault()
         this.close()
         break
@@ -977,13 +1042,13 @@ export class DronePanoramaViewer {
   // ───────────────────────────── 内部:杂项 ─────────────────────────────
 
   private lockScroll(): void {
-    if (typeof document === 'undefined') return
+    if (this.inline || typeof document === 'undefined') return
     this.bodyOverflow = document.body.style.overflow
     document.body.style.overflow = 'hidden'
   }
 
   private unlockScroll(): void {
-    if (typeof document === 'undefined') return
+    if (this.inline || typeof document === 'undefined') return
     document.body.style.overflow = this.bodyOverflow
   }
 
@@ -1003,6 +1068,25 @@ export class DronePanoramaViewer {
   private template(): string {
     const download = this.options.downloadable === false ? ' hidden' : ''
     const importer = this.options.importable ? '' : ' hidden'
+    // 内嵌模式:没有遮罩与标题栏,HUD 与操作钮浮在画面上;title/hud 节点仍要存在(open 会写)
+    if (this.inline) {
+      return `
+      <div class="divp-frame">
+        <span class="divp-title" data-role="title" hidden></span>
+        <div class="divp-stage" data-role="stage">
+          <canvas class="divp-canvas" data-role="canvas"></canvas>
+          <p class="divp-note" data-role="note" hidden></p>
+          <span class="divp-hud-float" data-role="hud"></span>
+          <div class="divp-inline-actions">
+            <button type="button" class="divp-btn" data-action="reset" title="视角复位 (0)">复位</button>
+            <button type="button" class="divp-btn" data-action="download" title="下载原图"${download}>下载原图</button>
+          </div>
+        </div>
+        <div class="divp-foot">拖动环视球面 · 滚轮缩放 · 双击或 0 复位</div>
+      </div>
+      <input type="file" accept="image/*" data-role="file" hidden />
+    `
+    }
     return `
       <div class="divp-mask" data-role="mask" data-action="close"></div>
       <div class="divp-frame">

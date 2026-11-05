@@ -129,6 +129,7 @@ export class DroneWorld {
   private readonly group = new THREE.Group()
   private readonly homeMarker = new THREE.Object3D()
   private readonly gridHelpers: THREE.GridHelper[] = []
+  private captureHelperVisibility: Map<THREE.Object3D, boolean> | null = null
   private readonly obstacles: THREE.Object3D[] = []
   private readonly disposables: Array<THREE.BufferGeometry | THREE.Material | THREE.Texture> = []
   private readonly trailPositions: Float32Array
@@ -460,6 +461,23 @@ export class DroneWorld {
   }
 
   /**
+   * 显示/隐藏「地面参照」:4000m 底板 + 米级细网格 + 百米粗网格。
+   *
+   * 给自建布景的宿主用 —— 布景自己带了整片地面(海面/地形)时,库的底板会
+   * 和它叠在同一高度上互相穿插。返航点标记不在此列,它始终保留。
+   */
+  setGroundVisible(visible: boolean): void {
+    for (const grid of this.gridHelpers) grid.visible = visible
+    // 底板是 group 里唯一一处 receiveShadow 的 PlaneGeometry 网格,按几何类型找,
+    // 不另存字段(避免为一次性开关扩张构造函数)
+    this.group.traverse((object) => {
+      if (object instanceof THREE.Mesh && object.geometry instanceof THREE.PlaneGeometry) {
+        object.visible = visible
+      }
+    })
+  }
+
+  /**
    * 采集辅助显隐 —— 拍照 / 录像取景时应临时隐藏的**场景标记**。
    *
    * 这些是给**用户**看的辅助图层,不是场景内容,却都长得像"竖线":
@@ -472,10 +490,16 @@ export class DroneWorld {
    * 调用方负责配对(隐藏后必须在同一帧内恢复),成对的调用点在 DroneFly 的取景路径里。
    */
   setCaptureHelpersVisible(visible: boolean): void {
-    this.homeMarker.visible = visible
-    if (this.trailLine) this.trailLine.visible = visible
-    this.missionGroup.visible = visible
-    for (const grid of this.gridHelpers) grid.visible = visible
+    if (!visible) {
+      if (this.captureHelperVisibility) return
+      const helpers: THREE.Object3D[] = [this.homeMarker, this.missionGroup, ...this.gridHelpers]
+      if (this.trailLine) helpers.push(this.trailLine)
+      this.captureHelperVisibility = new Map(helpers.map((helper) => [helper, helper.visible]))
+      for (const helper of helpers) helper.visible = false
+    } else if (this.captureHelperVisibility) {
+      for (const [helper, previous] of this.captureHelperVisibility) helper.visible = previous
+      this.captureHelperVisibility = null
+    }
   }
 
   /**

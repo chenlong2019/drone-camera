@@ -218,6 +218,34 @@ function quaternionConjugate(q: Quaternion): Quaternion {
   return [-q[0], -q[1], -q[2], q[3]]
 }
 
+/**
+ * 用四元数（`[x,y,z,w]`，主动旋转）旋转一个三维向量。
+ *
+ * 相机位姿存的是 **camera-local → world** 的四元数，要把相机自身的轴（right=+X /
+ * up=+Y / forward=-Z）落到世界里画视锥，就得做这一步。
+ *
+ * 用 `v' = v + w·t + q×t`（`t = 2·(q×v)`）而不是构造 `q·v·q⁻¹`：少一半乘法，而且
+ * 不会在中间量上引入第二次归一化误差。返回长度 = 输入长度（纯旋转）。
+ *
+ * ```ts
+ * // 绕 +Z 转 90° 后，+X 轴应该落到 +Y
+ * rotateVectorByQuaternion([1, 0, 0], [0, 0, Math.SQRT1_2, Math.SQRT1_2]) // ≈ [0, 1, 0]
+ * ```
+ */
+export function rotateVectorByQuaternion(vector: Vector3, rotation: Quaternion): Vector3 {
+  assertVector(vector, 'vector')
+  const [x, y, z, w] = normalizeQuaternion(rotation)
+  const [vx, vy, vz] = vector
+  const tx = 2 * (y * vz - z * vy)
+  const ty = 2 * (z * vx - x * vz)
+  const tz = 2 * (x * vy - y * vx)
+  return [
+    vx + w * tx + (y * tz - z * ty),
+    vy + w * ty + (z * tx - x * tz),
+    vz + w * tz + (x * ty - y * tx),
+  ]
+}
+
 /** Convert a column-basis 3×3 rotation matrix to an [x,y,z,w] quaternion. */
 function quaternionFromMatrix3(columns: [Vector3, Vector3, Vector3]): Quaternion {
   const [x, y, z] = columns

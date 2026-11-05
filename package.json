@@ -10,14 +10,21 @@
     "test:unit": "vitest",
     "test:e2e": "playwright test",
     "build-only": "vite build",
+    "mavlink:bridge": "node mavlink/bridge.mjs",
+    "mavlink:fake-sitl": "node mavlink/fake-sitl.mjs",
+    "mavlink:verify": "node mavlink/verify-crc-extra.mjs && node mavlink/verify-codec.mjs && node mavlink/verify-px4-contract.mjs && node mavlink/verify-loop.mjs && node mavlink/verify-loop.mjs --legacy",
     "build:lib": "node scripts/build-lib.mjs",
+    "colmap:export": "node scripts/export-colmap.mjs",
     "pack:lib": "node scripts/build-lib.mjs && npm pack ./drone-camera",
     "publish:lib": "node scripts/build-lib.mjs && npm publish ./drone-camera --access public",
     "type-check": "vue-tsc --build",
     "lint": "run-s \"lint:*\"",
     "lint:oxlint": "oxlint . --fix",
     "lint:eslint": "eslint . --fix --cache",
-    "format": "prettier --write --experimental-cli src/"
+    "format": "prettier --write --experimental-cli src/",
+    "colmap:inspect": "node scripts/colmap-to-splat.mjs",
+    "video:relay": "node video-link/relay.mjs",
+    "video:relay:local": "node video-link/relay.mjs --host 127.0.0.1"
   },
   "dependencies": {
     "@vue-flow/background": "^1.3.2",

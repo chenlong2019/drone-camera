@@ -50,3 +50,6 @@ playwright-report/
 
 # WorkBuddy 助手记忆(本地工具数据)
 /.workbuddy/
+
+# 3DGS 训练产物(42MB,由 gaussian-splatting/output 拷入,不入库)
+/public/recon74.ply

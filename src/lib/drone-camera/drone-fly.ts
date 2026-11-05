@@ -15,7 +15,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import type { DronePanelHost } from './drone-control'
 import { createHuskyDroneModel } from './drone-husky-model'
 import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import type { WebGPURenderer } from 'three/webgpu'
+import type { DroneRendererLike } from './drone-renderer'
 import { DroneLights, statusPatternFor } from './drone-lights'
 import type { AuxLightMode, BatteryLightMode, StatusLightKey } from './drone-lights'
 import { DroneRig, type RigPartReport } from './drone-rig'
@@ -154,7 +154,20 @@ const LEG_DEPLOY_RATE = 2.5
  */
 const LEG_RETRACT_ALTITUDE = 0.6
 /** 拍照等待渲染的兜底时限(毫秒),超时按失败处理 */
-const PHOTO_TIMEOUT_MS = 2000
+const PHOTO_TIMEOUT_MS = 5000
+/** 图传取帧的兜底时限(毫秒):一帧抓不出来就返回 null,由调用方下一拍重试 */
+const VIDEO_FRAME_TIMEOUT_MS = 1500
+/**
+ * 图传默认出图参数:640×360 左右 / JPEG 0.6 / 15 fps。
+ * 来源默认 `'view'`(零额外渲染):`'gimbal'` 要多渲一帧完整场景,由调用方按机器能力显式开启。
+ */
+const VIDEO_FRAME_DEFAULTS = {
+  source: 'view',
+  width: 640,
+  height: 0,
+  quality: 0.6,
+  maxFps: 15,
+} as const
 /** 录像参数:帧率 / 码率 / 分片间隔 */
 const RECORD_FPS = 30
 const RECORD_BITRATE = 8_000_000
@@ -173,6 +186,36 @@ export interface PhotoShot {
   height: number
   /** 与该 PNG 同一渲染帧的取景相机快照。 */
   camera?: CaptureCameraState
+}
+
+/** 图传取帧参数(全部有默认值) */
+export interface VideoFrameOptions {
+  /**
+   * 画面来源:
+   * - `'view'`(默认)**取当前主画布** —— 用户看到什么就传什么。零额外渲染,任何机器都不掉帧;
+   * - `'gimbal'` 额外渲一帧**云台取景** —— 语义最接近真机图传(与地面站视角无关),
+   *   代价是每帧多一次完整场景渲染。实测在软光栅环境里这一笔能把 60fps 打到个位数,
+   *   硬件 GPU 上约 3~6 ms/帧,所以留给调用方按机器能力选。
+   */
+  source?: 'view' | 'gimbal'
+  /** 目标宽度(像素);高度按取景相机宽高比推导,保证不变形 */
+  width?: number
+  /** 目标高度上限;0 或缺省表示只受宽度约束 */
+  height?: number
+  /** JPEG 质量 0~1 */
+  quality?: number
+  /** 抓帧上限帧率(仅 `gimbal` 来源需要排队等渲染) */
+  maxFps?: number
+}
+
+/** 一帧图传画面(云台取景) */
+export interface VideoFrameShot {
+  /** JPEG 字节,可直接塞进 WebSocket 二进制帧 */
+  data: ArrayBuffer
+  width: number
+  height: number
+  /** 从抓帧到拿到 JPEG 的耗时(毫秒),用于判断主线程余量 */
+  encodeMs: number
 }
 
 /** 相机位姿快照:取景帧(拍照 / 录像)渲染完必须还回去 */
@@ -221,7 +264,7 @@ export interface DroneFlyInitializeOptions {
 export class DroneFly implements DronePanelHost {
   camera: THREE.PerspectiveCamera | null
   scene: THREE.Scene<THREE.Object3DEventMap> | null
-  renderer: WebGPURenderer | null
+  renderer: DroneRendererLike | null
   controls: OrbitControls<THREE.Camera> | null
   model: THREE.Group | null = null
   lights: DroneLights | null = null
@@ -304,6 +347,33 @@ export class DroneFly implements DronePanelHost {
   } | null = null
   /** 云台相机取景用的独立相机(拍照不影响主相机对象本身) */
   private readonly captureCamera = new THREE.PerspectiveCamera()
+  /**
+   * 图传取帧的待办请求。
+   *
+   * 同一时刻只挂一个:15 fps 的抓帧如果允许排队,一帧渲染慢了就会越积越多,
+   * 最后看到的是几秒前的画面。抓着帧就丢新请求,对图传来说"丢帧"远好过"延迟"。
+   */
+  private videoRequest: {
+    resolve: (shot: VideoFrameShot | null) => void
+    timer: number
+    options: Required<VideoFrameOptions>
+  } | null = null
+  /** 图传专用离屏画布:复用同一个 canvas,避免每帧新建触发纹理/上下文创建开销 */
+  private videoCanvas: HTMLCanvasElement | null = null
+  private videoContext: CanvasRenderingContext2D | null = null
+  /** 上一帧编码还没结束:此时不再抓帧(JPEG 编码是同步 + toBlob 异步,叠加会卡主线程) */
+  private videoBusy = false
+  /** 上一次成功抓帧的时刻,用于按 maxFps 节流 */
+  private lastVideoFrameAt = 0
+  /**
+   * WebRTC 视频源:专用 2d canvas + 按需出帧轨道(见 `createVideoStream`)。
+   * 与 M-JPEG 的 `videoCanvas` 分开:两边节流节奏与目标尺寸都可能不同。
+   */
+  private videoStreamCanvas: HTMLCanvasElement | null = null
+  private videoStream: MediaStream | null = null
+  private videoStreamTrack: CanvasCaptureMediaStreamTrack | null = null
+  private videoStreamFps = 15
+  private lastStreamFrameAt = 0
   /** 屏录:sim.recording 是状态来源,这里负责真正的 MediaRecorder */
   private recorder: MediaRecorder | null = null
   private recordChunks: Blob[] = []
@@ -314,6 +384,18 @@ export class DroneFly implements DronePanelHost {
   private recordContext: CanvasRenderingContext2D | null = null
   /** 进入机载视角前的观察者缩放,退出时归还(变焦只在机载取景下生效) */
   private savedZoom: number | null = null
+  /**
+   * 进入机载视角前的轨道偏移(相机相对控制点的位矢),退出时归还。
+   *
+   * ⚠ 只归还 target 不归还相机会让轨道半径塌缩:fpv 把相机放到了云台位置(≈飞机位置),
+   * 出 fpv 时 target 钉回飞机、相机原地不动 → 半径 ≈ 0.7m,平移/旋转/滚轮全部在
+   * 指尖尺度上打转,用户看到的就是"视角控制全失灵"。
+   */
+  private savedOrbitOffset: THREE.Vector3 | null = null
+  /** 用户正在拖拽轨道(按下到抬起之间):跟随逻辑让位,pan 的位移不能被逐帧抵消 */
+  private orbitUserGesture = false
+  /** 上一帧飞机位置:判定飞机是否在动(静止时不推进跟随,用户 pan 的画面才稳得住) */
+  private readonly prevDronePosition = new THREE.Vector3()
   /** 录像收尾回调:UI 用它落盘(引擎不直接触发下载) */
   onRecordingReady: ((blob: Blob, seconds: number) => void) | null = null
 
@@ -321,13 +403,21 @@ export class DroneFly implements DronePanelHost {
   constructor(
     scene: THREE.Scene<THREE.Object3DEventMap> | null,
     camera: THREE.PerspectiveCamera | null,
-    renderer: WebGPURenderer | null,
+    renderer: DroneRendererLike | null,
     controls: OrbitControls<THREE.Camera> | null,
   ) {
     this.scene = scene
     this.camera = camera
     this.renderer = renderer
     this.controls = controls
+    // OrbitControls 的 start/end 手势边界:拖拽期间 cameraTarget 必须骑在控制点上,
+    // 否则观察者视角的自动跟随(见 updateCamera)会把用户的平移逐帧原样抵消 ——
+    // 表现为"右键拖动松手后弹回原处 / 拖动中画面纹丝不动"
+    controls?.addEventListener('start', () => { this.orbitUserGesture = true })
+    controls?.addEventListener('end', () => {
+      this.orbitUserGesture = false
+      this.cameraTarget.copy(controls.target)
+    })
   }
 
   /**
@@ -469,6 +559,9 @@ export class DroneFly implements DronePanelHost {
 
     this.syncPose(delta)
     this.updateCamera(delta)
+    // 图传取帧:渲一帧云台视角再还原。放在主渲染之前,宿主紧跟着渲染用户视角,
+    // 所以画面上看不到任何切换(未推流时这里是一个空判,零开销)
+    this.pumpVideoFrame()
     this.pushTrail()
     // 仿真侧关掉了录像(重置/降落等):收尾并交出成片
     if (this.recorder && !this.sim.recording) void this.stopRecording()
@@ -647,13 +740,32 @@ export class DroneFly implements DronePanelHost {
     if (this.controls) this.controls.enabled = mode === 'orbit'
     // 变焦只在机载取景下生效:进入时记下观察者视角的缩放,离开时归还,
     // 这样轨道视角的滚轮缩放不会被相机变焦覆盖
-    if (this.camera && mode === 'fpv' && previous !== 'fpv') this.savedZoom = this.camera.zoom
+    if (this.camera && mode === 'fpv' && previous !== 'fpv') {
+      this.savedZoom = this.camera.zoom
+      // 同样要存轨道偏移(相机−控制点),见 savedOrbitOffset 的注释
+      if (this.controls) this.savedOrbitOffset = this.camera.position.clone().sub(this.controls.target)
+    }
     // 进机载视角时重置电子增稳状态,否则会从上一段视角的位姿慢慢滑过来
     if (mode === 'fpv') this.fpvQuatReady = false
     if (this.camera && mode !== 'fpv' && previous === 'fpv') {
       this.camera.zoom = this.savedZoom ?? 1
       this.camera.updateProjectionMatrix()
       this.savedZoom = null
+    }
+    if (this.camera && mode === 'follow' && previous !== 'follow') {
+      // 直接切到跟随机位,不做从当前视角扫过去的过渡。原因不只是观感:
+      // WebGPU 下着色器管线是「首次见到的视锥内容」按需编译的,一秒的 lerp 扫掠
+      // 会路过几十个从未渲染过的中间视锥,每个都触发一批新管线编译 —— 实测主循环
+      // 被顶到 7fps 并持续整个过渡期。瞬间切换只用目标视锥一个,配合 demo 层的
+      // prewarmRenderContexts(加载期/上电后已渲染过同一机位)可以做到零编译卡顿。
+      const rad = (this.sim.heading * Math.PI) / 180
+      const droneY = this.groundOffsetY + this.sim.position.y
+      this.camera.position.set(
+        this.sim.position.x - Math.sin(rad) * FOLLOW_DISTANCE,
+        droneY + FOLLOW_HEIGHT,
+        this.sim.position.z + Math.cos(rad) * FOLLOW_DISTANCE,
+      )
+      this.camera.lookAt(this.sim.position.x, droneY + 0.6, this.sim.position.z)
     }
     if (mode === 'orbit') {
       // 回到观察者视角时保留当前朝向,只把控制点交还给轨道控制器
@@ -663,6 +775,12 @@ export class DroneFly implements DronePanelHost {
         this.sim.position.z,
       )
       this.controls?.target.copy(this.cameraTarget)
+      // 归还轨道偏移:相机退回"控制点 + 原偏移"的位置,半径/朝向都与进 fpv 前一致,
+      // 否则相机还压在飞机身上(半径≈0),轨道控制等于废掉
+      if (this.camera && this.controls && this.savedOrbitOffset) {
+        this.camera.position.copy(this.controls.target).add(this.savedOrbitOffset)
+        this.savedOrbitOffset = null
+      }
     }
   }
 
@@ -673,6 +791,19 @@ export class DroneFly implements DronePanelHost {
 
   /** 直接把无人机移动到目标位置并同步观察点/朝向 */
   flyTo(target: { x?: number; y?: number; z?: number; heading?: number; pitch?: number; roll?: number }): void {
+    // 外部接管时不能瞬移模型 —— 真机会自己飞过去,这里把目标点转成位置指令
+    if (
+      this.sim.external &&
+      this.sim.dispatchExternal({
+        type: 'goto',
+        x: target.x ?? this.sim.position.x,
+        y: target.y ?? this.sim.position.y,
+        z: target.z ?? this.sim.position.z,
+        heading: target.heading,
+      })
+    ) {
+      return
+    }
     const next = { ...this.sim.position }
     if (target.x !== undefined) next.x = target.x
     if (target.y !== undefined) next.y = Math.max(0, target.y)
@@ -839,6 +970,24 @@ export class DroneFly implements DronePanelHost {
   /** 机体当前方位角(度,罗盘角)—— 全景扫描用它判断"转到位了没" */
   getBodyHeading(): number {
     return this.sim.heading
+  }
+
+  /**
+   * 把机体**放到**指定 ENU 位置(米,x 东 / y 北 / z 上)—— 重建采集专用。
+   *
+   * 只改 `sim.position`,不动姿态与云台:胶卷式的"飞到下一个拍点"在仿真里没有意义
+   * (基线是几何量,不取决于飞了多久),而位姿依然是真值。真机走导出的航线。
+   * 高度按 AGL 处理:`sim.position.y` 就是相对起飞点的高度。
+   */
+  placeBodyAt(enu: [number, number, number]): void {
+    this.sim.position.x = enu[0]
+    this.sim.position.y = Math.max(0, enu[2])
+    this.sim.position.z = -enu[1]
+  }
+
+  /** 机体当前 ENU 位置(米,x 东 / y 北 / z 上) */
+  getBodyPosition(): [number, number, number] {
+    return [this.sim.position.x, -this.sim.position.z, this.sim.position.y]
   }
 
   /** 记下当前相机位姿,供取景帧渲染完还原 */
@@ -1070,7 +1219,12 @@ export class DroneFly implements DronePanelHost {
   /** 渲染后钩子:与渲染同一任务内拷屏,然后把相机位姿还原 */
   onAfterRender(): void {
     const request = this.photoRequest
-    if (!request) return
+    if (!request) {
+      // 拍照优先;没有拍照时服务「当前画面」图传请求 —— 此刻画布上正是刚渲完的那一帧
+      this.serveViewVideoFrame()
+      this.pumpVideoStream()
+      return
+    }
     this.photoRequest = null
     window.clearTimeout(request.timer)
     const shot = this.grabCanvas()
@@ -1088,6 +1242,31 @@ export class DroneFly implements DronePanelHost {
     request.resolve(shot)
   }
 
+  /**
+   * `view` 来源的图传帧:主渲染**刚结束**时拷画布。
+   *
+   * 为什么必须在这里:WebGPU 画布在提交之后内容即失效,不在渲染任务内 drawImage
+   * 只能拿到全黑(踩过)。拍照走的是同一条时机,所以两者共用这个钩子。
+   */
+  private serveViewVideoFrame(): void {
+    const request = this.videoRequest
+    if (!request || request.options.source !== 'view' || this.videoBusy) return
+    this.videoRequest = null
+    window.clearTimeout(request.timer)
+    this.lastVideoFrameAt = performance.now()
+    const grabbed = this.drawIntoVideoCanvas(request.options)
+    if (!grabbed) {
+      request.resolve(null)
+      return
+    }
+    this.videoBusy = true
+    const startedAt = performance.now()
+    this.encodeVideoCanvas(request.options.quality, grabbed, startedAt).then((shot) => {
+      this.videoBusy = false
+      request.resolve(shot)
+    })
+  }
+
   /** 把当前画布内容拷进离屏 canvas(同一任务内执行,拿到的是刚渲染的那一帧) */
   private grabCanvas(): PhotoShot | null {
     const source = this.renderer?.domElement as HTMLCanvasElement | undefined
@@ -1099,6 +1278,266 @@ export class DroneFly implements DronePanelHost {
     if (!context) return null
     context.drawImage(source, 0, 0)
     return { dataUrl: target.toDataURL('image/png'), width: target.width, height: target.height }
+  }
+
+  // ————————————————————————————— 图传取帧 —————————————————————————————
+
+  /**
+   * 开一条 WebRTC 视频流(发送端轨道)。
+   *
+   * 三个设计决定:
+   * - **从专用 2d canvas 取流,不从主画布**。主画布是 WebGPU 的,`captureStream` 抓它
+   *   的时机不受我们控制;而 2d canvas 在 `pumpVideoStream` 里由我们自己喂数据,
+   *   喂数据的时机与 M-JPEG 的 `view` 来源完全相同(onAfterRender),已验证拿得到真画面。
+   * - **`captureStream(0)` + `requestFrame()` 手动出帧**。探针实测:`captureStream(fps)`
+   *   自动抓帧会被带宽估计牵着走(画质降到 320×180),手动推帧则始终全分辨率。
+   * - **默认 960 宽**。WebRTC 这条路有真编码器,640×360 是给 M-JPEG 省带宽用的;
+   *   VP8 960×540 实测 ~1.5 Mbps,比 M-JPEG 640×360(~3 Mbps)还便宜。
+   *
+   * 返回 null 表示浏览器不支持(无 captureStream / 无视频轨道),调用方回退 M-JPEG。
+   */
+  createVideoStream(options: { width?: number; maxFps?: number } = {}): MediaStream | null {
+    if (!this.renderer || this.destroyed) return null
+    if (typeof HTMLCanvasElement === 'undefined' || !HTMLCanvasElement.prototype.captureStream) return null
+    const source = this.renderer.domElement as HTMLCanvasElement
+    if (!source?.width || !source?.height) return null
+
+    this.videoStreamFps = clamp(options.maxFps ?? 15, 5, 30)
+    if (!this.videoStreamCanvas) {
+      const canvas = document.createElement('canvas')
+      const context = canvas.getContext('2d', { alpha: false })
+      if (!context) return null
+      // 先定尺寸再取流:轨道的分辨率跟随 canvas 尺寸(规范行为),开局就定对避免 renegotiate
+      const width = Math.max(320, Math.round(options.width ?? 960))
+      const w = Math.min(width, source.width)
+      canvas.width = w
+      canvas.height = Math.max(2, Math.round(w * (source.height / source.width)))
+      let stream: MediaStream
+      try {
+        stream = canvas.captureStream(0)
+      } catch {
+        return null
+      }
+      const track = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack | undefined
+      if (!track || typeof track.requestFrame !== 'function') {
+        track?.stop()
+        return null
+      }
+      this.videoStreamCanvas = canvas
+      this.videoStream = stream
+      this.videoStreamTrack = track
+    }
+    return this.videoStream
+  }
+
+  /** 关掉并释放 WebRTC 视频流(切回 M-JPEG / 销毁时调用) */
+  destroyVideoStream(): void {
+    this.videoStreamTrack?.stop()
+    this.videoStreamTrack = null
+    this.videoStream = null
+    this.videoStreamCanvas = null
+  }
+
+  /** 当前是否开着 WebRTC 视频流 */
+  get hasVideoStream(): boolean {
+    return this.videoStreamTrack?.readyState === 'live'
+  }
+
+  /**
+   * 往 WebRTC 视频流里喂数据,由 `onAfterRender` 每帧调用(与 M-JPEG 同一条时机)。
+   *
+   * 为什么必须在这个时机:WebGPU 画布在提交之后内容即失效,不在渲染任务内
+   * drawImage 只能拿到全黑(踩过,与 M-JPEG 的 `view` 来源同一坑)。
+   * 为什么对主循环零开销:只有一次 2d drawImage(硬件加速) + 一次轨道通知,
+   * 编码在 WebRTC 的独立线程里跑,探针实测主循环 rAF 间隔不变。
+   */
+  private pumpVideoStream(): void {
+    const track = this.videoStreamTrack
+    const canvas = this.videoStreamCanvas
+    const source = this.renderer?.domElement as HTMLCanvasElement | undefined
+    if (!track || !canvas || !source || !source.width || !source.height) return
+    if (track.readyState !== 'live') return
+    const now = performance.now()
+    if (now - this.lastStreamFrameAt < (1000 / this.videoStreamFps) * 0.85) return
+    // 跟随主画布比例(窗口 resize 时),宽度保持开局决定值
+    const w = canvas.width
+    const h = Math.round(w * (source.height / source.width))
+    if (h > 0 && canvas.height !== h) canvas.height = h
+    const context = canvas.getContext('2d', { alpha: false })
+    if (!context) return
+    context.drawImage(source, 0, 0, w, canvas.height)
+    track.requestFrame()
+    this.lastStreamFrameAt = now
+  }
+
+  /**
+   * 抓一帧图传画面,编码成 JPEG 字节。
+   *
+   * 两个来源(`source`):
+   * - `'view'`(默认)**直接拷当前主画布**,零额外渲染。用户看到什么就传什么 ——
+   *   想看机载画面就切「机载视角」,此时画面本身就是云台取景。任何机器都不会掉帧。
+   * - `'gimbal'` 额外渲一帧云台取景(语义最接近真机图传,与地面站视角无关)。
+   *   ⚠️ 这一帧是**完整场景的第二次渲染**:硬件 GPU 约 3~6 ms,但软光栅环境实测能把
+   *   主循环从 60 fps 打到个位数(1440×900 + 后期管线),所以只适合按机器能力显式开启。
+   *
+   * 三个为 15 fps 服务的设计:
+   * - **缩到 640×360 再编码**:原尺寸 PNG 一帧 1~2 MB、编码几十毫秒,15 fps 会把主线程顶满;
+   *   JPEG 0.6 在 640×360 下约 10~30 KB。
+   * - **复用同一块离屏画布**:每帧新建 canvas 会不断分配/回收纹理与 2D 上下文。
+   * - **只服务一个挂起请求**(`gimbal` 路径):上一帧还没编码完就丢掉本次请求,
+   *   宁可少一帧也不要排队(排队 = 延迟越滚越大)。
+   *
+   * 返回 null:模型未就绪 / 正在编码 / 与拍照抢帧 —— 调用方下一拍再来。
+   */
+  requestVideoFrame(options: VideoFrameOptions = {}): Promise<VideoFrameShot | null> {
+    if (!this.renderer || !this.camera || !this.rig) return Promise.resolve(null)
+    if (this.videoBusy || this.photoRequest) return Promise.resolve(null)
+    const merged: Required<VideoFrameOptions> = {
+      source: options.source ?? VIDEO_FRAME_DEFAULTS.source,
+      width: Math.max(64, Math.round(options.width ?? VIDEO_FRAME_DEFAULTS.width)),
+      height: Math.max(0, Math.round(options.height ?? VIDEO_FRAME_DEFAULTS.height)),
+      quality: clamp(options.quality ?? VIDEO_FRAME_DEFAULTS.quality, 0.1, 0.95),
+      maxFps: clamp(options.maxFps ?? VIDEO_FRAME_DEFAULTS.maxFps, 1, 60),
+    }
+    // 两个来源都要"在渲染刚结束时拿画布":WebGPU 画布在提交之后内容就失效了,
+    // 随手 drawImage 只会拿到一张全黑。区别只在拿画布之前要不要换相机:
+    // `view` 让宿主照常渲染用户视角,渲完直接拷;`gimbal` 在 animate 里先渲一帧云台视角。
+    if (this.videoRequest) return Promise.resolve(null)
+    const now = performance.now()
+    // 节流留 15% 余量:rAF 量化后的间隔总是略大于理论值,硬卡 1000/maxFps
+    // 会让"每 66 ms 请求一次"退化成"每 83 ms 才成一次"(实测 15 fps 掉到 12)
+    if (now - this.lastVideoFrameAt < (1000 / merged.maxFps) * 0.85) return Promise.resolve(null)
+    return new Promise<VideoFrameShot | null>((resolve) => {
+      const timer = window.setTimeout(() => {
+        if (this.videoRequest) {
+          this.videoRequest = null
+          resolve(null)
+        }
+      }, VIDEO_FRAME_TIMEOUT_MS)
+      this.videoRequest = { resolve, timer, options: merged }
+    })
+  }
+
+  /**
+   * 图传取帧的实际执行者(`gimbal` 来源),由 `animate()` 每帧调用(在 syncPose 之后)。
+   *
+   * 放在 animate 而不是拍照用的 onBeforeRender/onAfterRender:那两个钩子在宿主
+   * 主渲染的**同一帧**里换相机会让画面闪一下云台视角;而 animate 跑在主渲染之前,
+   * 这里渲完云台视角后宿主紧接着会把用户视角盖回去,肉眼看不到切换。
+   */
+  private pumpVideoFrame(): void {
+    const request = this.videoRequest
+    const camera = this.camera
+    const scene = this.scene
+    const renderer = this.renderer
+    const source = renderer?.domElement as HTMLCanvasElement | undefined
+    if (!request || !camera || !scene || !renderer || !source) return
+    // `view` 来源由 onAfterRender 拷画布,这里只服务需要换相机的 `gimbal`
+    if (request.options.source !== 'gimbal') return
+    if (this.videoBusy) return
+    const now = performance.now()
+    if (now - this.lastVideoFrameAt < 1000 / request.options.maxFps) return
+    if (!source.width || !source.height) return
+
+    const restore = this.snapshotCamera()
+    // delta 传 0:图传要的是"此刻",不能像实时画面那样做电子增稳低通(会多一帧迟滞)
+    const posed = this.applyGimbalCameraPose(camera, {
+      zoom: this.sim.cameraZoom,
+      delta: 0,
+      fixedCenter: true,
+      instant: true,
+    })
+    if (!posed) {
+      window.clearTimeout(request.timer)
+      this.videoRequest = null
+      request.resolve(null)
+      return
+    }
+
+    this.setCaptureFrameVisible(false)
+    camera.updateMatrixWorld(true)
+    renderer.render(scene, camera)
+    const grabbed = this.drawIntoVideoCanvas(request.options)
+    this.setCaptureFrameVisible(true)
+    if (restore) this.restoreCamera(restore)
+
+    window.clearTimeout(request.timer)
+    this.videoRequest = null
+    this.lastVideoFrameAt = now
+    if (!grabbed) {
+      request.resolve(null)
+      return
+    }
+    this.videoBusy = true
+    const startedAt = now
+    this.encodeVideoCanvas(request.options.quality, grabbed, startedAt).then((shot) => {
+      this.videoBusy = false
+      request.resolve(shot)
+    })
+  }
+
+  /** 把主画布按目标尺寸画进复用的离屏画布;返回实际出图尺寸 */
+  private drawIntoVideoCanvas(
+    options: Pick<Required<VideoFrameOptions>, 'width' | 'height'>,
+  ): { width: number; height: number } | null {
+    const source = this.renderer?.domElement as HTMLCanvasElement | undefined
+    if (!source || !source.width || !source.height) return null
+    // 目标尺寸:按画布宽高比缩到目标宽度,高度上限只做保护(不拉伸)
+    const aspect = source.height / source.width
+    let outWidth = Math.min(options.width, source.width)
+    let outHeight = Math.round(outWidth * aspect)
+    if (options.height > 0 && outHeight > options.height) {
+      outHeight = options.height
+      outWidth = Math.round(outHeight / aspect)
+    }
+    outWidth = Math.max(2, outWidth)
+    outHeight = Math.max(2, outHeight)
+    if (!this.videoCanvas) {
+      this.videoCanvas = document.createElement('canvas')
+      this.videoContext = this.videoCanvas.getContext('2d', { alpha: false })
+    }
+    const canvas = this.videoCanvas
+    const context = this.videoContext
+    if (!canvas || !context) return null
+    if (canvas.width !== outWidth || canvas.height !== outHeight) {
+      canvas.width = outWidth
+      canvas.height = outHeight
+    }
+    context.drawImage(source, 0, 0, outWidth, outHeight)
+    return { width: outWidth, height: outHeight }
+  }
+
+  /** 离屏画布 → JPEG 字节 */
+  private encodeVideoCanvas(
+    quality: number,
+    size: { width: number; height: number },
+    startedAt: number,
+  ): Promise<VideoFrameShot | null> {
+    const canvas = this.videoCanvas
+    if (!canvas) return Promise.resolve(null)
+    return new Promise<VideoFrameShot | null>((resolve) => {
+      canvas.toBlob(
+        (blob) => {
+          if (!blob) {
+            resolve(null)
+            return
+          }
+          void blob
+            .arrayBuffer()
+            .then((data) =>
+              resolve({
+                data,
+                width: size.width,
+                height: size.height,
+                encodeMs: Math.round(performance.now() - startedAt),
+              }),
+            )
+            .catch(() => resolve(null))
+        },
+        'image/jpeg',
+        quality,
+      )
+    })
   }
 
   // ————————————————————————————— 录像 —————————————————————————————
@@ -1230,7 +1669,17 @@ export class DroneFly implements DronePanelHost {
 
     // 观察者:轨道控制器接管,但控制点平滑跟住飞机,避免飞出视野后找不回来
     if (this.cameraAutoFollow) {
-      this.cameraTarget.lerp(dronePosition, Math.min(1, delta * 2.2))
+      // 飞机静止时不推进跟随:否则用户 pan 出去的画面会被 lerp 慢慢拽回飞机,
+      // 体感就是"右键平移松手后弹回原处"。飞机一动,跟随照常恢复。
+      const droneMoved = this.prevDronePosition.distanceToSquared(dronePosition) > 1e-6
+      this.prevDronePosition.copy(dronePosition)
+      if (this.orbitUserGesture || !droneMoved) {
+        // 用户手势中(以及阻尼收尾期):控制点被 pan 挪到哪 cameraTarget 跟到哪,
+        // 否则下面的 shift 会把用户的平移逐帧原样抵消(松手即弹回)
+        this.cameraTarget.copy(this.controls?.target ?? this.cameraTarget)
+      } else {
+        this.cameraTarget.lerp(dronePosition, Math.min(1, delta * 2.2))
+      }
       if (this.controls) {
         this.cameraShift.subVectors(this.cameraTarget, this.controls.target)
         this.controls.target.add(this.cameraShift)
@@ -1242,9 +1691,25 @@ export class DroneFly implements DronePanelHost {
     }
   }
 
+  /**
+   * 把观察者(轨道)相机摆到指定位姿 —— 宿主落位机体后用它对齐视角。
+   *
+   * ⚠️ 只改 camera.position / controls.target 是不够的:orbit 模式下内部
+   * `cameraTarget` 才是跟随真相,初始在原点,第一帧 autoFollow 会朝飞机 lerp
+   * 一步并把 target/相机整体拽走(飞机静止后跟随冻结,页面就停在一个错误机位)。
+   * 这里把内部跟随状态一并同步,并视作"飞机没动过"冻结跟随,宿主摆的机位才站得住。
+   */
+  setOrbitCamera(position: THREE.Vector3, target: THREE.Vector3): void {
+    this.setCameraMode('orbit')
+    this.camera?.position.copy(position)
+    this.controls?.target.copy(target)
+    this.cameraTarget.copy(target)
+    this.prevDronePosition.copy(this.sim.position)
+    this.cameraAutoFollow = true
+  }
+
   /** 复位相机:回到观察者视角、还原缩放,并把机位重置到飞机斜后上方 */
-  resetCamera(): void {
-    if (!this.camera || !this.controls) return
+  resetCamera(): void {    if (!this.camera || !this.controls) return
     this.setCameraMode('orbit')
     this.cameraAutoFollow = true
     if (this.camera.zoom !== 1) {
@@ -1753,6 +2218,15 @@ export class DroneFly implements DronePanelHost {
   /** 销毁飞行沙盒:停渲染循环、拆面板、释放场景与渲染器 */
   destroy(): void {
     this.destroyed = true
+    // 图传取帧还在路上:清掉定时器并让调用方立刻拿到 null,别等超时
+    if (this.videoRequest) {
+      window.clearTimeout(this.videoRequest.timer)
+      this.videoRequest.resolve(null)
+      this.videoRequest = null
+    }
+    this.videoCanvas = null
+    this.videoContext = null
+    this.destroyVideoStream()
     // 录制中直接收摊(页面卸载不触发下载)
     if (this.recorder) {
       try {

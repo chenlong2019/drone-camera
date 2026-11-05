@@ -4,10 +4,11 @@
   DRONE_MODELS,
   DroneCapturePanel,
   DroneControlPanel,
+  FlightSourceManager,
   MissionPanel,
   loadCesiumScript,
 } from '@/lib'
-import type { DroneModelSpec } from '@/lib'
+import type { DroneModelSpec, FlightSourceKind, FlightSourceState } from '@/lib'
 import { assetUrl, ensureStylesheet } from '@/utils/asset-url'
 
 /** Optional Cesium ion token supplied at build time through VITE_CESIUM_ION_TOKEN. */
@@ -30,6 +31,10 @@ export interface CesiumDemoApi {
   destroy(): void
   getStats(): Record<string, unknown>
   cycleModel(): DroneModelSpec | null
+  /** 飞控源热切换(内置模型 ⇄ PX4 / SITL);失败会自动回退内置并抛错 */
+  setFlightSource(kind: FlightSourceKind, url?: string): Promise<FlightSourceState>
+  /** 当前飞控源状态快照 */
+  getFlightSource(): FlightSourceState
 }
 
 export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
@@ -39,6 +44,15 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
   let missionPanel: MissionPanel | null = null
   let capturePanel: DroneCapturePanel | null = null
   let captureService: CaptureService | null = null
+  /**
+   * 飞控源切换器:内置模型 ⇄ 外部 MAVLink。
+   *
+   * 和 three 页共用同一个实现(库里的 `FlightSourceManager`),差别只在 Cesium 是真实地理坐标,
+   * 所以这里显式把飞控的 home 锚点钉在场景原点 —— 否则 PX4 报的 HOME_POSITION 与 Cesium
+   * 的 ENU 原点差几百公里,机体会被画到地球另一边。
+   */
+  let sources: FlightSourceManager | null = null
+  let flightSource: FlightSourceState = { kind: 'internal', url: null, status: null, error: null }
 
   async function init(): Promise<void> {
     // Cesium 内部按 CESIUM_BASE_URL 拼 Workers / Assets 路径，必须显式给，否则子路径部署下全是 404
@@ -121,6 +135,28 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
     adapter.powerOn()
     adapter.setArmsFolded(false)
 
+    // 飞控源:`?mavlink=ws://…` 时启动即接外部飞控;接管点是 adapter.sim,
+    // 所以两个面板、采集服务、Cesium 相机跟随全部照旧工作
+    const params = new URLSearchParams(window.location.search)
+    const mavlinkUrl = params.get('mavlink')
+    sources = new FlightSourceManager({
+      sim: adapter.sim,
+      mavlinkUrl: mavlinkUrl ?? undefined,
+      mavlink: {
+        // 场景原点作为 ENU 锚点:飞控的 local 坐标直接落在 Cesium 这片街区上
+        home: { longitude: ORIGIN.lon, latitude: ORIGIN.lat, altitude: 0 },
+      },
+      onChange: (state) => {
+        flightSource = state
+      },
+    })
+    if (mavlinkUrl) {
+      // 不 await:连不上要等 5 s,不该卡住 Cesium 首屏;失败会回退内置模型
+      void sources.useMavlink(mavlinkUrl).catch((error: unknown) => {
+        console.warn('[cesium-demo] MAVLink 接入失败,继续使用内置飞控:', error)
+      })
+    }
+
     captureService = new CaptureService({ provider: adapter })
 
     panel = new DroneControlPanel(adapter, {
@@ -154,7 +190,7 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
         missionPanel,
         capturePanel,
         captureService,
-        api: { init, destroy, getStats, cycleModel },
+        api: { init, destroy, getStats, cycleModel, setFlightSource, getFlightSource },
       }
     }
   }
@@ -188,10 +224,28 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
       recording: sim.recording,
       modelLoaded: adapter.modelLoaded,
       models: DRONE_MODELS.map((m) => m.key),
+      flightSource: flightSource.kind,
+      mavlink: flightSource.status,
     }
   }
 
+  async function setFlightSource(kind: FlightSourceKind, url?: string): Promise<FlightSourceState> {
+    if (!sources) return flightSource
+    if (kind === 'internal') await sources.useInternal()
+    else await sources.useMavlink(url)
+    return sources.state
+  }
+
+  function getFlightSource(): FlightSourceState {
+    return flightSource
+  }
+
   function destroy(): void {
+    // 外部会话先于 adapter 销毁:它每帧往 sim 里写状态,并持有 WebSocket
+    sources?.destroy()
+    sources = null
+    flightSource = { kind: 'internal', url: null, status: null, error: null }
+
     capturePanel?.destroy()
     capturePanel = null
     missionPanel?.destroy()
@@ -205,5 +259,5 @@ export function useCesiumDemo(container: HTMLElement): CesiumDemoApi {
     viewer = null
   }
 
-  return { init, destroy, getStats, cycleModel }
+  return { init, destroy, getStats, cycleModel, setFlightSource, getFlightSource }
 }

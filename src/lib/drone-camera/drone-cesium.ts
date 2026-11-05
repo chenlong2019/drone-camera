@@ -1122,6 +1122,19 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
 
   /** 直接把无人机移动到目标本地坐标位置,并保持离地高度不低于地形 */
   flyTo(target: { x?: number; y?: number; z?: number; heading?: number; pitch?: number; roll?: number }): void {
+    // 外部接管时不能瞬移模型 —— 真机会自己飞过去,这里把目标点转成位置指令
+    if (
+      this.sim.external &&
+      this.sim.dispatchExternal({
+        type: 'goto',
+        x: target.x ?? this.sim.position.x,
+        y: target.y ?? this.sim.position.y,
+        z: target.z ?? this.sim.position.z,
+        heading: target.heading,
+      })
+    ) {
+      return
+    }
     const nextX = target.x ?? this.sim.position.x
     const nextY = target.y ?? this.sim.position.y
     const nextZ = target.z ?? this.sim.position.z
@@ -1225,6 +1238,24 @@ export class CesiumDroneAdapter implements DronePanelHost, MissionPanelHost, Ces
   /** 机体当前方位角(度,罗盘角)—— 全景扫描用它判断"转到位了没" */
   getBodyHeading(): number {
     return this.sim.heading
+  }
+
+  /**
+   * 把机体**放到**指定 ENU 位置(米,x 东 / y 北 / z 上)—— 重建采集专用。
+   *
+   * 只改 `sim.position`,不动姿态与云台:胶卷式的"飞到下一个拍点"在仿真里没有意义
+   * (基线是几何量,不取决于飞了多久),而位姿依然是真值。真机走导出的航线。
+   * 高度按 AGL 处理:`sim.position.y` 就是相对起飞点的高度。
+   */
+  placeBodyAt(enu: [number, number, number]): void {
+    this.sim.position.x = enu[0]
+    this.sim.position.y = Math.max(0, enu[2])
+    this.sim.position.z = -enu[1]
+  }
+
+  /** 机体当前 ENU 位置(米,x 东 / y 北 / z 上) */
+  getBodyPosition(): [number, number, number] {
+    return [this.sim.position.x, -this.sim.position.z, this.sim.position.y]
   }
 
   /**

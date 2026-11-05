@@ -124,12 +124,38 @@ export interface PanoramaShotRef {
   pitch: number
 }
 
+/**
+ * 影像在一次**重建采集**(为 3DGS / SfM 拍数据)里的定位,写进 `metadata.recon`。
+ *
+ * 与 `PanoramaShotRef` 的区别是语义上的:全景是**光心不动、只转朝向**,
+ * 所以只需记行列;重建必须**移动光心**,于是要记它在哪一圈、哪个网格点,
+ * 以及它属于哪种轨迹 —— 否则采回来的一堆图无法回溯"这块表面被哪几个视角看到"。
+ */
+export interface ReconShotRef {
+  /** 采集组 id:同一次重建采集共用一个 */
+  group: string
+  /** 轨迹标识(`orbit` / `grid-tilt` / `sphere`);用 string 以免形成循环依赖 */
+  pattern: string
+  /** 组内序号(1 起,按拍摄顺序) */
+  index: number
+  /** 组内总张数 */
+  total: number
+  /** 环绕:第几圈(0 起);网格 / 球壳:恒为 0 */
+  ring: number
+  /** 网格行(0 起) */
+  row: number
+  /** 网格列(0 起) */
+  col: number
+}
+
 /** 虚拟采集的附加参数 */
 export interface VirtualCaptureOptions {
   /** 本次取景的俯仰覆盖(用完自动复位;见 CaptureViewOverride) */
   view?: CaptureViewOverride | null
   /** 本次取景属于哪个全景组 */
   panorama?: PanoramaShotRef
+  /** 本次取景属于哪个重建采集组 */
+  recon?: ReconShotRef
 }
 
 /** 统一影像条目(虚拟采集与真实导入共用) */
@@ -162,6 +188,8 @@ export interface CapturedImage {
     engine?: string
     /** 全景扫描定位(属于某次 180°/360° 拍摄时才有) */
     panorama?: PanoramaShotRef
+    /** 重建采集定位(属于某次为 3DGS 拍的数据时才有) */
+    recon?: ReconShotRef
     /** 真实照片的原始 EXIF(保留原始字段,避免二次解析丢信息) */
     exif?: ExifData
   }
@@ -277,6 +305,16 @@ export interface VirtualCaptureProvider {
   spinBodyTo?(headingDeg: number | null): void
   /** 机体当前方位角(度,罗盘角);没实现的后端返回 undefined */
   getBodyHeading?(): number
+  /**
+   * 把机体**放到**指定的 ENU 位置(米,x 东 / y 北 / z 上);虚拟重建采集专用。
+   *
+   * ⚠️ 语义是"放置"而不是"飞过去":仿真里没有理由为了生成训练数据真飞十分钟,
+   * 位姿依然是真值,数据质量与飞过去完全一致。**真机**上这一步对应"按导出的航线飞到
+   * 该航点",必须真的飞 —— 所以 `drone-recon-capture` 同时能导出航点。
+   */
+  placeBodyAt?(enu: [number, number, number]): void
+  /** 机体当前 ENU 位置(米);没实现的后端返回 undefined */
+  getBodyPosition?(): [number, number, number]
 }
 
 /** 会话汇总(面板与导出共用) */
@@ -642,7 +680,7 @@ export class CaptureService {
       // 成片到手后再读相机状态(那一刻仍是取景帧的仿真状态,含本次的俯仰覆盖)
       // 渲染后端若锁存了同帧状态，优先使用它，避免 await 后读取到下一帧。
       const camera = shot.camera ?? provider.getCaptureCamera()
-      const image = this.buildVirtualImage(session, shot, camera, options.panorama)
+      const image = this.buildVirtualImage(session, shot, camera, options.panorama, options.recon)
       session.images.push(image)
       if (session.status === 'created') session.status = 'capturing'
       this.touch(session)
@@ -670,11 +708,37 @@ export class CaptureService {
     this.provider?.spinBodyTo?.(headingDeg)
   }
 
+  // ──────────────────────── 机体定位(重建采集) ────────────────────────
+
+  /** 后端是否支持"把机体放到指定位置" —— 重建采集的基线只有它做得出来 */
+  get canPlaceBody(): boolean {
+    return typeof this.provider?.placeBodyAt === 'function'
+  }
+
+  /**
+   * 把机体放到 ENU 位置(米)。后端不支持时什么都不做 —— 调用方先用 `canPlaceBody` 判定,
+   * 否则会得到一组"光心没动"的图:那正好退化成全景,而文件看起来完全正常。
+   */
+  placeBodyAt(enu: [number, number, number] | null): void {
+    if (!enu) return
+    this.provider?.placeBodyAt?.(enu)
+  }
+
+  /** 机体当前 ENU 位置(米);后端不支持时返回 null */
+  getBodyPosition(): [number, number, number] | null {
+    const position = this.provider?.getBodyPosition?.()
+    if (!position) return null
+    return Number.isFinite(position[0]) && Number.isFinite(position[1]) && Number.isFinite(position[2])
+      ? [position[0], position[1], position[2]]
+      : null
+  }
+
   private buildVirtualImage(
     session: CaptureSession,
     shot: VirtualShot,
     camera: CaptureCameraState | null,
     panorama?: PanoramaShotRef,
+    recon?: ReconShotRef,
   ): CapturedImage {
     const timestamp = this.now().toISOString()
     const { width, height } = { width: shot.width, height: shot.height }
@@ -707,6 +771,7 @@ export class CaptureService {
         sceneVersion: camera?.scene?.version ?? session.options.sceneVersion,
         engine: camera ? this.provider?.engine : undefined,
         panorama,
+        recon,
       },
       validation: { status: 'pending', messages: [] },
     }

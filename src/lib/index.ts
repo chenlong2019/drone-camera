@@ -69,6 +69,30 @@ export * from './drone-camera/drone-cesium'
 export * from './drone-camera/drone-engine'
 
 // ──────────────────────────────────────────────────────────────────────────
+// 3d. MAVLink / SITL 接入：把真飞控（PX4 / ArduPilot）的遥测灌进同一个 DroneSim。
+//     · drone-mavlink        —— MAVLink 2 编解码（表驱动，零依赖，可单独用于解析 tlog）
+//     · drone-mavlink-defs   —— 消息定义表 + CRC_EXTRA（由 mavlink/verify-crc-extra.mjs 校验）
+//     · drone-mavlink-source —— WebSocket 连接 / 遥测归一化 / 指令翻译 / 坐标换算
+//     · drone-flight-source  —— 飞控源切换器(内置模型 ⇄ 外部 MAVLink,失败自动回退)
+//
+//     接管点是 `DroneSim` 而不是渲染器，所以两套后端与全部面板一行都不用改：
+//       const source = new MavlinkSource({ url: 'ws://127.0.0.1:8118' })
+//       source.attach(drone.sim); await source.connect()
+// ──────────────────────────────────────────────────────────────────────────
+export * from './drone-camera/drone-mavlink-defs'
+export * from './drone-camera/drone-mavlink'
+export * from './drone-camera/drone-mavlink-source'
+export * from './drone-camera/drone-flight-source'
+
+// ──────────────────────────────────────────────────────────────────────────
+// 3e. 图传（视频同传）：机载画面推到局域网中转，手机 / 另一台电脑开网页就能看。
+//     · drone-video-link —— 发布端客户端(连接 / 背压丢帧 / OSD / 统计 / 断线重连)
+//     帧由后端提供:`DroneFly.requestVideoFrame()` 渲一帧**云台取景** → 缩到 640×360
+//     → JPEG 编码 → ArrayBuffer。中转与观看页在 `video-link/`(零依赖,node 直接跑)。
+// ──────────────────────────────────────────────────────────────────────────
+export * from './drone-camera/drone-video-link'
+
+// ──────────────────────────────────────────────────────────────────────────
 // 4. 交互层:原生 DOM 控制面板(飞行控制 / 机载视角切换 / 云台 / 拍照 / 录像)
 //    同样与框架无关 —— 只用 DOM 与 CSS,Vue / React / 裸页面都能直接挂载
 // ──────────────────────────────────────────────────────────────────────────
@@ -109,10 +133,15 @@ export * from './drone-camera/drone-minimap'
 //    虚拟影像的取景帧与相机状态由渲染后端提供(DroneFly / CesiumDroneAdapter 都实现了
 //    VirtualCaptureProvider),采集服务自己不建第二个 Viewer。
 // ──────────────────────────────────────────────────────────────────────────
+//     · drone-colmap-export —— manifest → COLMAP 三件套(cameras.txt / images.txt / points3D.txt)
+//     · drone-capture-bundle —— 采集包:影像 + manifest + 三件套打成一个 ZIP(store 模式,零依赖),
+//                             解压即可直接跑 colmap feature_extractor
 export * from './drone-camera/drone-exif'
 export * from './drone-camera/drone-capture'
 export * from './drone-camera/drone-capture-manifest'
 export * from './drone-camera/drone-capture-panel'
+export * from './drone-camera/drone-capture-bundle'
+export * from './drone-camera/drone-colmap-export'
 export * from './drone-camera/drone-gallery'
 export * from './drone-camera/drone-image-utils'
 export * from './drone-camera/drone-image-viewer'
@@ -121,3 +150,16 @@ export * from './drone-camera/drone-panorama'
 export * from './drone-camera/drone-stitch'
 export * from './drone-camera/drone-photogrammetry'
 export * from './drone-camera/drone-reconstruction-preview'
+export * from './drone-camera/drone-splat'
+export * from './drone-camera/drone-splat-viewer'
+export * from './drone-camera/drone-reconstruction-source'
+export * from './drone-camera/drone-recon-capture'
+export * from './drone-camera/drone-survey'
+// ──────────────────────────────────────────────────────────────────────────
+//     · drone-amap —— 高德 JS API 2.0 封装(独立地图宿主,不是 Cesium 底图):
+//                     脚本注入(安全密钥必须在注入前写入)+ 机体/航线/航迹覆盖物同步 +
+//                     WGS84 ⇄ GCJ-02 转换(不转换的话机体在图上会偏 ~500m)
+export * from './drone-camera/drone-amap'
+// · drone-amap-control —— 地图屏的 DronePanelHost 适配器(控制面板/键盘/摇杆接得上;
+//   视角映射到地图相机,拍照与取景如实降级)
+export * from './drone-camera/drone-amap-control'

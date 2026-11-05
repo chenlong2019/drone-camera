@@ -1,0 +1,62 @@
+{
+  "revision": "park-v3",
+  "units": "inferred metres",
+  "site": { "west": -120, "east": 120, "north": -100, "south": 100 },
+  "lawn": { "x": 43, "z": 36, "width": 138, "depth": 116, "cornerRadius": 4 },
+  "buildings": [
+    { "id": "tower", "name": "主塔楼", "type": "tower", "x": -73, "z": -31, "width": 30, "depth": 28, "height": 64, "baseHeight": 10, "podiumWidth": 49, "podiumDepth": 39, "features": ["vertical-glazing-slots", "panel-seams", "podium", "roof-equipment"] },
+    { "id": "west-hall", "name": "西侧圆角办公楼", "type": "rounded-tower", "x": -85, "z": 65, "width": 44, "depth": 42, "height": 46, "floors": 10, "radius": 18, "roofGarden": true, "features": ["curved-curtain-wall", "horizontal-floor-bands", "stepped-wing", "roof-garden"] },
+    { "id": "pavilion", "name": "圆筒交流中心", "type": "drum", "x": -65, "z": 14, "width": 32, "depth": 28, "height": 18, "floors": 4, "radius": 14, "roofGarden": true, "features": ["cylindrical-glazing", "roof-ring-garden", "rooftop-room"] },
+    { "id": "west-back", "name": "西北办公楼", "type": "banded", "x": -104, "z": -75, "width": 24, "depth": 30, "height": 33, "floors": 8, "features": ["horizontal-window-bands", "flat-roof"] },
+    { "id": "north-office", "name": "北侧研发楼", "type": "grid", "x": -58, "z": -77, "width": 30, "depth": 26, "height": 34, "floors": 8, "features": ["punched-window-grid", "rooftop-room"] },
+    { "id": "glass-tower", "name": "玻璃办公塔楼", "type": "glass-tower", "x": 12, "z": -75, "width": 27, "depth": 30, "height": 54, "floors": 12, "features": ["full-height-curtain-wall", "fine-mullion-grid", "roof-skylight"] },
+    { "id": "research", "name": "研发办公楼", "type": "fins", "x": 39, "z": -73, "width": 25, "depth": 29, "height": 43, "floors": 10, "features": ["vertical-fins", "tower-pair"] },
+    { "id": "north-east-office", "name": "东北研发楼", "type": "grid", "x": 68, "z": -76, "width": 25, "depth": 27, "height": 34, "floors": 8, "features": ["punched-window-grid", "roof-skylight"] },
+    { "id": "east-tower", "name": "东侧办公塔楼", "type": "fins", "x": 106, "z": -77, "width": 23, "depth": 29, "height": 42, "floors": 10, "roofGarden": true, "features": ["vertical-fins", "terrace-link"] },
+    { "id": "east-hall", "name": "屋顶花园办公楼", "type": "garden-office", "x": 94, "z": -53, "width": 31, "depth": 31, "height": 32, "floors": 7, "radius": 6, "roofGarden": true, "features": ["curved-glass-corner", "side-fins", "roof-garden", "green-podium"] },
+    { "id": "link-hall", "name": "北侧百叶展厅", "type": "rounded-louver", "x": 5, "z": -2, "width": 53, "depth": 25, "height": 22, "floors": 4, "radius": 5, "features": ["rounded-roof", "horizontal-louvers"] },
+    { "id": "courtyard-link", "name": "庭院连廊", "type": "banded", "x": 43, "z": 0, "width": 22, "depth": 22, "height": 13, "floors": 3, "features": ["glazed-link", "roof-terrace"] },
+    { "id": "terrace-hall", "name": "退台综合楼", "type": "terraced-block", "x": 79, "z": 0, "width": 52, "depth": 25, "height": 21, "floors": 4, "roofGarden": true, "roofRoomHeight": 6, "features": ["stepped-roof", "rooftop-room", "planted-terrace"] },
+    { "id": "south-hall", "name": "南侧会展中心", "type": "louver-hall", "x": 13, "z": 76, "width": 76, "depth": 28, "height": 22, "floors": 4, "radius": 6, "features": ["horizontal-louvers", "white-pilasters", "rooftop-room"] },
+    { "id": "east-louver", "name": "东侧会展中心", "type": "louver-hall", "x": 94, "z": 47, "width": 30, "depth": 64, "height": 23, "floors": 4, "radius": 3, "roofGarden": true, "features": ["horizontal-louvers", "roof-garden", "atrium-connection"] },
+    { "id": "forum", "name": "圆形会议馆", "type": "forum", "x": 1, "z": 36, "width": 36, "depth": 36, "height": 13, "floors": 3, "radius": 18, "features": ["circular-footprint", "white-ring-bands", "flat-disc-roof"] },
+    { "id": "glass-atrium", "name": "弧形玻璃入口", "type": "atrium", "x": 76, "z": 80, "width": 26, "depth": 22, "height": 18, "floors": 3, "radius": 8, "features": ["curved-transparent-envelope", "visible-floor-slabs", "entrance-doors", "glass-roof"] }
+  ],
+  "roads": [
+    { "id": "west-road", "axis": "z", "at": -131, "start": -620, "end": 620, "width": 16 },
+    { "id": "east-road", "axis": "z", "at": 131, "start": -620, "end": 620, "width": 16 },
+    { "id": "north-road", "axis": "x", "at": -110, "start": -700, "end": 700, "width": 16 },
+    { "id": "south-road", "axis": "x", "at": 110, "start": -700, "end": 700, "width": 16 },
+    { "id": "inner-west", "axis": "z", "at": -35, "start": -110, "end": 110, "width": 9 },
+    { "id": "inner-north", "axis": "x", "at": -29, "start": -35, "end": 131, "width": 9 },
+    { "id": "service-drive", "axis": "z", "at": -3, "start": -49, "end": -29, "width": 7 }
+  ],
+  "landscape": {
+    "paths": [[49, 35, 5, 45], [39, 60, 61, 3.6], [47, 15, 56, 3.6], [117, 37, 3.4, 105], [61, 82, 26, 12]],
+    "treeRows": [[-119, -94, -119, 93, 11, 0.82], [-43, -90, -43, 90, 12, 0.78], [-109, 96, 109, 96, 12, 0.85], [120, -94, 120, 88, 11, 0.8], [-108, -97, 108, -97, 12, 0.72], [-18, -21, 106, -21, 13, 0.72], [30, 22, 30, 52, 10, 0.68], [66, 23, 66, 52, 10, 0.7], [-23, 17, -23, 53, 10, 0.62]],
+    "shrubs": [[53, 24, 20, 4], [54, 49, 23, 4], [-84, 40, 30, 3], [-66, -5, 29, 3], [67, -46, 21, 3]]
+  },
+  "qualityContract": {
+    "criticalFeatures": ["rounded-glass-tower", "cylindrical-buildings", "louvered-front-halls", "rooftop-gardens", "transparent-curved-atrium"],
+    "mustMatch": ["Main tower remains the dominant height", "Different facade types have physical geometry", "Former lawn becomes a landscaped courtyard with a circular hall", "Entrances and new buildings remain clear of the internal road", "Roof greenery is supported by terraces and parapets"],
+    "representation": "Procedural architectural reconstruction; dimensions and hidden interiors are inferred."
+  },
+  "lighting": { "sun": [-150, 230, 160], "intensity": 3.1, "hemisphere": 1.05, "exposure": 1.0 },
+  "views": {
+    "isometric": { "position": [248, 224, 307], "target": [0, 17, 0], "fov": 29 },
+    "human": { "position": [150, 10, 168], "target": [24, 25, 13], "fov": 51 },
+    "top": { "position": [0, 475, 0.01], "target": [0, 0, 0], "fov": 38 },
+    "rear": { "position": [-255, 210, -290], "target": [0, 19, 0], "fov": 38 },
+    "diagonal": { "position": [-270, 185, 265], "target": [0, 14, 0], "fov": 38 },
+    "distant": { "position": [380, 340, 440], "target": [0, 0, -35], "fov": 40 }
+  },
+  "evidence": {
+    "primary": "D:/house/10_新园区原图.png",
+    "plan": "D:/house/11_新图视角1_高空正俯视.png",
+    "facade": "D:/house/12_新图视角2_低角度人视.png",
+    "rear": "D:/house/13_新图视角3_背面斜视角.png",
+    "distant": "D:/house/14_新图视角4_远距离鸟瞰.png",
+    "duplicate": "D:/house/09_建筑样式丰富版.png",
+    "limitations": ["Dimensions inferred from images; no survey scale supplied.", "Images 09 and 10 are byte-identical. The five unique new views replace the older sparse layout.", "Atrium interiors, some roof equipment and hidden service areas are inferred."]
+  }
+}

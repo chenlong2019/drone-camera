@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0d10" />
+    <title>DRONE LINK · 实时图传</title>
+    <style>
+      :root {
+        --bg: #0b0d10;
+        --panel: rgba(14, 17, 21, 0.72);
+        --line: rgba(255, 255, 255, 0.14);
+        --text: #eef2f6;
+        --muted: #98a2ad;
+        --accent: #35d0a5;
+        --warn: #f2b33d;
+        --bad: #ef5b5b;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        font-family: ui-sans-serif, system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        overflow: hidden;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      #stage {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: radial-gradient(circle at 50% 45%, #12161b 0%, #08090b 75%);
+        padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+          env(safe-area-inset-left);
+      }
+      canvas,
+      video {
+        max-width: 100%;
+        max-height: 100%;
+        display: block;
+        background: #000;
+      }
+      .hidden-el {
+        display: none !important;
+      }
+      .hud {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        font-variant-numeric: tabular-nums;
+      }
+      .top {
+        position: absolute;
+        top: calc(10px + env(safe-area-inset-top));
+        left: 12px;
+        right: 12px;
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 11px;
+        border-radius: 10px;
+        background: var(--panel);
+        border: 0.5px solid var(--line);
+        backdrop-filter: blur(6px);
+        font-size: 12px;
+        letter-spacing: 0.14em;
+      }
+      .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--bad);
+        box-shadow: 0 0 0 0 rgba(53, 208, 165, 0.5);
+      }
+      .dot.live {
+        background: var(--accent);
+        animation: pulse 1.6s ease-out infinite;
+      }
+      .dot.wait {
+        background: var(--warn);
+      }
+      @keyframes pulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(53, 208, 165, 0.45);
+        }
+        70% {
+          box-shadow: 0 0 0 9px rgba(53, 208, 165, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(53, 208, 165, 0);
+        }
+      }
+      .stats {
+        display: grid;
+        grid-auto-flow: column;
+        gap: 12px;
+        padding: 7px 11px;
+        border-radius: 10px;
+        background: var(--panel);
+        border: 0.5px solid var(--line);
+        backdrop-filter: blur(6px);
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .stats b {
+        color: var(--text);
+        font-weight: 500;
+        font-size: 12px;
+      }
+      .osd {
+        position: absolute;
+        left: 12px;
+        right: 12px;
+        bottom: calc(14px + env(safe-area-inset-bottom));
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        transition: opacity 0.25s;
+      }
+      .cell {
+        min-width: 74px;
+        padding: 6px 10px;
+        border-radius: 9px;
+        background: var(--panel);
+        border: 0.5px solid var(--line);
+        backdrop-filter: blur(6px);
+      }
+      .cell span {
+        display: block;
+        font-size: 10px;
+        letter-spacing: 0.1em;
+        color: var(--muted);
+      }
+      .cell b {
+        font-size: 15px;
+        font-weight: 500;
+      }
+      .cell.warn b {
+        color: var(--warn);
+      }
+      .cell.bad b {
+        color: var(--bad);
+      }
+      #empty {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        text-align: center;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.7;
+      }
+      #empty h1 {
+        font-size: 15px;
+        font-weight: 500;
+        letter-spacing: 0.18em;
+        color: var(--text);
+        margin: 0;
+      }
+      #empty.hidden {
+        display: none;
+      }
+      #hint {
+        max-width: 260px;
+      }
+      #fs {
+        position: absolute;
+        right: 12px;
+        bottom: calc(84px + env(safe-area-inset-bottom));
+        padding: 8px 12px;
+        border-radius: 9px;
+        border: 0.5px solid var(--line);
+        background: var(--panel);
+        color: var(--text);
+        font-size: 12px;
+        backdrop-filter: blur(6px);
+        pointer-events: auto;
+      }
+      #err {
+        position: absolute;
+        left: 12px;
+        bottom: calc(84px + env(safe-area-inset-bottom));
+        max-width: 62vw;
+        color: var(--bad);
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <canvas id="video" width="640" height="360"></canvas>
+      <video id="rtc" class="hidden-el" muted autoplay playsinline></video>
+      <div class="hud">
+        <div class="top">
+          <div class="brand"><span class="dot" id="dot"></span>DRONE LINK</div>
+          <div class="stats">
+            <div><b id="s-tr">MJPEG</b></div>
+            <div><b id="s-fps">0</b> fps</div>
+            <div><b id="s-kbps">0</b> kbps</div>
+            <div><b id="s-rtt">--</b> ms</div>
+            <div><b id="s-drop">0</b> 丢</div>
+          </div>
+        </div>
+        <div class="osd" id="osd"></div>
+        <div id="err"></div>
+        <button id="fs">全屏</button>
+        <div id="empty">
+          <h1>等待图传信号</h1>
+          <div id="hint">在无人机页面点顶部「图传」开始推流，这里会自动连上。</div>
+        </div>
+      </div>
+    </div>
+    <script type="module">
+      const canvas = document.getElementById('video')
+      const ctx = canvas.getContext('2d', { alpha: false })
+      const video = document.getElementById('rtc')
+      const dot = document.getElementById('dot')
+      const empty = document.getElementById('empty')
+      const errBox = document.getElementById('err')
+      const osd = document.getElementById('osd')
+      const sTr = document.getElementById('s-tr')
+      const sFps = document.getElementById('s-fps')
+      const sKbps = document.getElementById('s-kbps')
+      const sRtt = document.getElementById('s-rtt')
+      const sDrop = document.getElementById('s-drop')
+
+      // 传输方式:auto = 先试 WebRTC(WebCodecs/硬件编码,省 3 倍带宽),失败无缝回退 M-JPEG
+      const mode = new URLSearchParams(location.search).get('mode') ?? 'auto'
+
+      const socketUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?role=view`
+
+      let socket = null
+      let retry = 0
+      /** 只保留最新一帧：解码比帧率慢时必须丢旧帧，否则会越看越迟 */
+      let pending = null
+      let decoding = false
+      let lastFrameAt = 0
+      let localDropped = 0
+      let serverDropped = 0
+      let meta = null
+      let framesWindow = 0
+      let bytesWindow = 0
+      let pingId = 0
+      let rtt = null
+
+      // ————— WebRTC 接收侧 —————
+      let myId = null
+      let pc = null
+      /** 发布端是否开着 WebRTC 通道(rtc-unavailable / rtc-available 切换) */
+      let rtcAvailable = false
+      let helloRetry = 0
+      let helloTimer = null
+      /** 当前实际显示的通道:画面从哪来,HUD 就标哪个 */
+      let transport = 'mjpeg'
+      let rtcPresented = 0
+      let rtcPresentedSeen = 0
+      let rtcBytes = 0
+      const rtcStat = { kbps: 0, fps: 0, lost: 0, rtt: null }
+
+      function send(value) {
+        if (socket?.readyState === 1) socket.send(JSON.stringify(value))
+      }
+
+      function showTransport(which) {
+        transport = which
+        sTr.textContent = which === 'webrtc' ? 'WEBRTC' : 'MJPEG'
+        video.classList.toggle('hidden-el', which !== 'webrtc')
+        canvas.classList.toggle('hidden-el', which === 'webrtc')
+      }
+
+      function setState(state) {
+        dot.className = 'dot' + (state === 'live' ? ' live' : state === 'wait' ? ' wait' : '')
+        empty.classList.toggle('hidden', state === 'live')
+      }
+
+      // ————— WebRTC:观看端是 answer 方,offer 由发布端生成(它持有轨道) —————
+
+      function closePc() {
+        if (!pc) return
+        try {
+          pc.close()
+        } catch {
+          /* 已经关了 */
+        }
+        pc = null
+        video.srcObject = null
+        showTransport('mjpeg')
+      }
+
+      /** WebRTC 断了:无缝回 M-JPEG(canvas 一直在收),再按指数退避重试 */
+      function rtcDown(reason) {
+        closePc()
+        rtcAvailable = false
+        // 强制 webrtc 模式才把原因报出来;auto 模式回退是正常路径,不打扰
+        if (mode === 'webrtc') errBox.textContent = `WebRTC 断开(${reason})，已回退 M-JPEG`
+        scheduleHello()
+      }
+
+      function scheduleHello() {
+        if (helloTimer !== null || mode === 'mjpeg') return
+        const wait = Math.min(8000, 1000 * 2 ** helloRetry)
+        helloRetry += 1
+        helloTimer = setTimeout(() => {
+          helloTimer = null
+          if (socket?.readyState === 1 && !pc) send({ t: 'rtc-hello' })
+        }, wait)
+      }
+
+      async function onRtcOffer(sdp) {
+        closePc()
+        pc = new RTCPeerConnection({ iceServers: [] })
+        pc.ontrack = (event) => {
+          video.srcObject = event.streams[0]
+          void video.play?.().catch(() => {})
+        }
+        pc.onicecandidate = (event) => {
+          // 观看端 → 发布端的消息中转会自动补 from(观看端 id),不需要自己填 to
+          send({ t: 'rtc-ice', candidate: event.candidate ? event.candidate.toJSON() : null })
+        }
+        pc.onconnectionstatechange = () => {
+          const state = pc?.connectionState
+          if (state === 'failed') rtcDown('连接失败')
+          else if (state === 'disconnected') rtcDown('连接中断')
+          else if (state === 'closed') rtcDown('已关闭')
+        }
+        try {
+          await pc.setRemoteDescription({ type: 'offer', sdp: String(sdp) })
+          const answer = await pc.createAnswer()
+          await pc.setLocalDescription(answer)
+          send({ t: 'rtc-answer', sdp: pc.localDescription.sdp })
+        } catch (error) {
+          rtcDown(String(error?.message ?? error))
+        }
+      }
+
+      // 有真帧被合成器呈现才切显示:收到 track 不算数,黑屏/纯静帧不能算"出画"
+      function watchPresentation() {
+        if (typeof video.requestVideoFrameCallback === 'function') {
+          const onFrame = (_now, frameMeta) => {
+            rtcPresented = frameMeta.presentedFrames
+            lastFrameAt = performance.now()
+            if (transport !== 'webrtc') showTransport('webrtc')
+            video.requestVideoFrameCallback(onFrame)
+          }
+          video.requestVideoFrameCallback(onFrame)
+        }
+        // 兜底(无 rVFC 的浏览器):totalVideoFrames 走 getVideoPlaybackQuality
+      }
+      watchPresentation()
+
+      function draw(bitmap) {
+        if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+          canvas.width = bitmap.width
+          canvas.height = bitmap.height
+        }
+        ctx.drawImage(bitmap, 0, 0)
+        bitmap.close?.()
+      }
+
+      async function pump() {
+        if (decoding) return
+        decoding = true
+        while (pending) {
+          const buffer = pending
+          pending = null
+          try {
+            const bitmap = await createImageBitmap(new Blob([buffer], { type: 'image/jpeg' }))
+            draw(bitmap)
+            framesWindow += 1
+            bytesWindow += buffer.byteLength
+            lastFrameAt = performance.now()
+            setState('live')
+          } catch (error) {
+            // 单帧解码失败（半帧 / 编码异常）不影响后续，记一次就算
+            localDropped += 1
+          }
+        }
+        decoding = false
+      }
+
+      function enqueue(buffer) {
+        if (pending) localDropped += 1
+        pending = buffer
+        void pump()
+      }
+
+      function renderOsd() {
+        if (!meta) return
+        const cells = [
+          { label: 'ALT', value: `${(meta.alt ?? 0).toFixed(1)} m` },
+          { label: 'SPD', value: `${(meta.speed ?? 0).toFixed(1)} m/s` },
+          { label: 'HDG', value: `${Math.round(meta.heading ?? 0)}°` },
+          {
+            label: 'BAT',
+            value: `${Math.round(meta.battery ?? 0)}%`,
+            tone: (meta.battery ?? 100) <= 20 ? 'bad' : (meta.battery ?? 100) <= 35 ? 'warn' : '',
+          },
+          { label: 'MODE', value: meta.mode ?? '—' },
+          { label: 'SAT', value: `${meta.satellites ?? 0}` },
+        ]
+        if (meta.recording) cells.push({ label: 'REC', value: '●', tone: 'bad' })
+        osd.innerHTML = cells
+          .map(
+            (cell) =>
+              `<div class="cell ${cell.tone ?? ''}"><span>${cell.label}</span><b>${cell.value}</b></div>`,
+          )
+          .join('')
+      }
+
+      function connect() {
+        socket = new WebSocket(socketUrl)
+        socket.binaryType = 'arraybuffer'
+        socket.onopen = () => {
+          retry = 0
+          errBox.textContent = ''
+          setState('wait')
+        }
+        socket.onmessage = (event) => {
+          if (typeof event.data === 'string') {
+            let value = null
+            try {
+              value = JSON.parse(event.data)
+            } catch {
+              return
+            }
+            if (value.t === 'osd') {
+              meta = value
+              renderOsd()
+            } else if (value.t === 'stats') {
+              serverDropped = value.dropped ?? 0
+            } else if (value.t === 'pong' && value.id === pingId) {
+              rtt = Math.round(performance.now() - value.client)
+            } else if (value.t === 'hello') {
+              myId = value.id ?? null
+              // auto 模式连上就试着协商 WebRTC;失败会走 rtc-unavailable → 静默回 M-JPEG
+              if (mode !== 'mjpeg') send({ t: 'rtc-hello' })
+            } else if (value.t === 'rtc-available') {
+              rtcAvailable = true
+              helloRetry = 0
+              if (mode !== 'mjpeg' && !pc) send({ t: 'rtc-hello' })
+            } else if (value.t === 'rtc-unavailable') {
+              rtcAvailable = false
+              closePc()
+            } else if (value.t === 'rtc-offer' && mode !== 'mjpeg') {
+              void onRtcOffer(value.sdp)
+            } else if (value.t === 'signal' && value.publisher === false) {
+              pending = null
+              meta = null
+              osd.innerHTML = ''
+              closePc()
+              rtcAvailable = false
+              setState('wait')
+            }
+            return
+          }
+          enqueue(event.data)
+        }
+        socket.onclose = () => {
+          socket = null
+          pending = null
+          closePc()
+          rtcAvailable = false
+          setState('off')
+          errBox.textContent = '图传链路断开，正在重连…'
+          const wait = Math.min(4000, 600 * 2 ** retry)
+          retry += 1
+          setTimeout(connect, wait)
+        }
+        socket.onerror = () => {
+          // onclose 会接手重连，这里只把原因说清楚
+          errBox.textContent = `连不上 ${socketUrl}（中转服务没启动？）`
+        }
+      }
+
+      // 1 Hz 刷新统计:帧率/码率按当前通道计;WebRTC 直接读 getStats(差分即码率)
+      setInterval(() => {
+        if (pc?.connectionState === 'connected') {
+          void pc
+            .getStats()
+            .then((report) => {
+              report.forEach((item) => {
+                if (item.type === 'inbound-rtp' && item.kind === 'video') {
+                  const bytes = item.bytesReceived ?? 0
+                  rtcStat.kbps = Math.max(0, Math.round(((bytes - rtcBytes) * 8) / 1000))
+                  rtcBytes = bytes
+                  rtcStat.fps = Math.round(item.framesPerSecond ?? 0)
+                  rtcStat.lost = Math.max(0, item.packetsLost ?? 0)
+                }
+                if (
+                  item.type === 'candidate-pair' &&
+                  item.state === 'succeeded' &&
+                  typeof item.currentRoundTripTime === 'number'
+                ) {
+                  rtcStat.rtt = Math.round(item.currentRoundTripTime * 1000)
+                }
+              })
+            })
+            .catch(() => {})
+        }
+        // 2 s 没有新呈现帧:WebRTC 名义上连着但没出画,回 M-JPEG(canvas 一直在收)
+        if (transport === 'webrtc' && rtcPresented === rtcPresentedSeen) {
+          if (performance.now() - lastFrameAt > 2000) showTransport('mjpeg')
+        }
+        rtcPresentedSeen = rtcPresented
+
+        if (transport === 'webrtc') {
+          sFps.textContent = String(rtcStat.fps)
+          sKbps.textContent = String(rtcStat.kbps)
+          sRtt.textContent = rtcStat.rtt === null ? '--' : String(rtcStat.rtt)
+          sDrop.textContent = String(rtcStat.lost)
+          framesWindow = 0
+          bytesWindow = 0
+        } else {
+          sFps.textContent = String(framesWindow)
+          sKbps.textContent = String(Math.round((bytesWindow * 8) / 1000))
+          framesWindow = 0
+          bytesWindow = 0
+          sRtt.textContent = rtt === null ? '--' : String(rtt)
+          sDrop.textContent = String(localDropped + serverDropped)
+        }
+        if (socket?.readyState === 1) {
+          pingId += 1
+          socket.send(JSON.stringify({ t: 'ping', id: pingId, client: performance.now() }))
+        }
+        // 2 s 没有新帧就回到"等待"：链路可能还连着，但飞机那边停了推流
+        if (performance.now() - lastFrameAt > 2000) setState('wait')
+      }, 1000)
+
+      document.getElementById('fs').addEventListener('click', () => {
+        const root = document.documentElement
+        if (document.fullscreenElement) void document.exitFullscreen()
+        else void root.requestFullscreen?.()
+      })
+
+      setState('off')
+      connect()
+    </script>
+  </body>
+</html>

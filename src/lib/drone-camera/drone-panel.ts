@@ -878,10 +878,11 @@ export class DroneControlPanel {
       : ''
     this.refs.preflight.title = blocked.map((item) => `${item.label}:${item.detail}`).join('\n')
 
-    // 飞行模式:真值取 fly.flightMode
+    // 飞行模式:真值取 fly.flightMode;外部接管(MAVLink)时显示飞控上报的模式名
     const flightMode = fly.flightMode
-    this.refs.flightModeLabel.textContent =
-      FLIGHT_MODE_LIST.find((item) => item.key === flightMode)?.label ?? flightMode
+    this.refs.flightModeLabel.textContent = fly.sim.external
+      ? fly.sim.modeLabelText
+      : (FLIGHT_MODE_LIST.find((item) => item.key === flightMode)?.label ?? flightMode)
     this.root.querySelectorAll<HTMLElement>('[data-action="set-flight-mode"]').forEach((button) => {
       button.classList.toggle('is-active', button.dataset.mode === flightMode)
     })

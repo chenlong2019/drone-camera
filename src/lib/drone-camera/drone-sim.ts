@@ -790,6 +790,73 @@ function headingVector(headingDeg: number): { x: number; z: number } {
 }
 
 /**
+ * 外部飞行状态 —— 由 MAVLink 等外部源提供的「真值」,用来取代本类自己的物理积分。
+ *
+ * 坐标与本类内部完全一致(x 东 / y 上 / z 南,米,原点=返航点),姿角度制,
+ * 于是接管时**不需要任何单位换换算**;换算全部发生在接入层(见 drone-mavlink-source)。
+ */
+export interface ExternalFlightState {
+  position: { x: number; y: number; z: number }
+  /** 速度(米/秒);缺省时按位置差分推算 */
+  velocity?: { x: number; y: number; z: number }
+  /** 罗盘角(0=北,顺时针为正,度) */
+  heading: number
+  /** 俯仰(正=抬头)/ 横滚(正=右滚),度 */
+  tiltPitch: number
+  tiltRoll: number
+  /** 飞行阶段(接入方按飞控模式推导) */
+  phase: FlightPhase
+  /** 电机负载 0~1:桨叶转速的可视化来源 */
+  motorLoad?: number
+  batteryPercent?: number
+  batteryVoltage?: number
+  batteryCurrent?: number
+  satellites?: number
+  gimbalPitch?: number
+  gimbalYaw?: number
+  /** 模式文案(直接显示在面板上,如 "POSCTL" / "AUTO.MISSION") */
+  modeLabel?: string
+  positionSource?: PositionSource
+  /** 当前执行到的航点序号(来自 MISSION_CURRENT);-1 表示没有在执行航线 */
+  missionIndex?: number
+}
+
+/** 外部源可以接管的指令 —— 面板按下的按钮会先到这里,再由接入层转成 MAVLink */
+export type ExternalCommand =
+  | { type: 'arm'; armed: boolean }
+  | { type: 'takeoff' }
+  | { type: 'land' }
+  | { type: 'rth'; reason?: string }
+  | { type: 'mode'; mode: FlightMode }
+  | { type: 'goto'; x: number; y: number; z: number; heading?: number }
+  | { type: 'missionStart' }
+  | { type: 'missionPause' }
+  | { type: 'missionResume' }
+  | { type: 'missionStop' }
+
+/**
+ * 外部状态源接口 —— `DroneSim` 每帧向它取一次最新状态。
+ *
+ * 只要求两个能力:读状态、接指令。连接/重连/协议细节全部由实现方负责,
+ * 所以同一个内核既能接 MAVLink,也能接飞行日志回放(replay 只是"永远在线"的源)。
+ */
+export interface ExternalFlightSource {
+  /** 取最新状态;返回 null 表示这一帧没有新数据(保持上一帧的值) */
+  read(): ExternalFlightState | null
+  /** 链路是否在线:false 时面板的信号格会掉到 0 */
+  online(): boolean
+  /** 接收来自面板的指令(可缺席:纯回放源不需要) */
+  command?(command: ExternalCommand): void
+  /**
+   * 接收摇杆行程(可缺席:纯回放源 / 只读源不接操作)。
+   *
+   * 外部接管时**必须**走这条通道:本类的 step() 已经不再自己飞,
+   * 摇杆写进 `this.stick` 只会动面板上的杆子图形,飞机一动不动。
+   */
+  stick?(stick: Readonly<StickState>): void
+}
+
+/**
  * 飞控仿真内核(不依赖 three)。
  *
  * 持有全部飞行状态与可调参数:`step(dt)` 按时间片推进状态机、飞行、电池与失效保护;
@@ -800,6 +867,27 @@ export class DroneSim {
   config: SimConfig = { ...DEFAULT_CONFIG }
   faults: FaultFlags = { ...NO_FAULTS }
   obstacles: ObstacleBox[] = []
+
+  /**
+   * 外部状态源(MAVLink / SITL / 飞行日志回放)。非 null 时本类**不再自己飞** ——
+   * 位置、姿态、电量、阶段全部来自外部,`step()` 只推进时间与相机。
+   */
+  external: ExternalFlightSource | null = null
+
+  /** 外部遥测覆盖值:非 null 时取代内部模型的推算量(电池 / 模式文案 / 定位来源) */
+  private externalOverrides: {
+    batteryPercent: number | null
+    batteryVoltage: number | null
+    batteryCurrent: number | null
+    modeLabel: string | null
+    positionSource: PositionSource | null
+  } = {
+    batteryPercent: null,
+    batteryVoltage: null,
+    batteryCurrent: null,
+    modeLabel: null,
+    positionSource: null,
+  }
 
   phase: FlightPhase = 'powerOff'
   mode: FlightMode = 'normal'
@@ -910,6 +998,8 @@ export class DroneSim {
   private missionPauseReason = ''
   /** 暂停前所处的阶段:继续执行时按它决定是接着走启航段还是直接飞航点 */
   private missionPausedStage: MissionStage = 'idle'
+  private missionWaypointHold: { index: number } | null = null
+  private readonly missionArrivalListeners = new Set<(index: number) => void>()
   /** 任务起始时的总航程(米),仅用于进度条 */
   private missionTotalDistance = 0
   /** 按速度倍率缩放后的挡位参数缓存(见 specFor) */
@@ -1026,8 +1116,18 @@ export class DroneSim {
     return this.specFor(this.mode)
   }
 
-  /** 电量百分比 0~100(按真实容量积分,非线性掉电) */
+  /**
+   * 模式文案:外部接管时是飞控上报的模式名(POSCTL / AUTO.MISSION / LOITER …),
+   * 否则是本地三挡的名称。面板与快照共用这一处,保证两处显示永远一致。
+   */
+  get modeLabelText(): string {
+    return this.externalOverrides.modeLabel ?? this.modeSpec.label
+  }
+
+  /** 电量百分比 0~100(按真实容量积分,非线性掉电);外部接管时直接用飞控上报值 */
   get batteryPercent(): number {
+    const external = this.externalOverrides.batteryPercent
+    if (external !== null) return clamp(external, 0, 100)
     return clamp(100 - (this.batteryUsedWh / DRONE_SPEC.batteryWh) * 100, 0, 100)
   }
 
@@ -1042,14 +1142,18 @@ export class DroneSim {
     )
   }
 
-  /** 放电电流:按当前功率 / 近似电压估算 */
+  /** 放电电流:按当前功率 / 近似电压估算;外部接管时用飞控上报值 */
   get batteryCurrent(): number {
+    const external = this.externalOverrides.batteryCurrent
+    if (external !== null) return external
     // 6.4 V:除法的电压下限,防止电量趋零时电流发散
     return this.currentPowerWatts / Math.max(6.4, this.openCircuitVoltage)
   }
 
-  /** 端电压 = 开路电压 − 内阻压降 */
+  /** 端电压 = 开路电压 − 内阻压降;外部接管时用飞控上报值 */
   get batteryVoltage(): number {
+    const external = this.externalOverrides.batteryVoltage
+    if (external !== null) return external
     return Math.max(
       6,
       // 下限 6 V:避免低电量时内阻压降把端电压算成负数
@@ -1059,6 +1163,8 @@ export class DroneSim {
 
   /** 当前定位来源:GNSS(≥6 星且指南针正常)→ 视觉 → 姿态模式 */
   get positionSource(): PositionSource {
+    const external = this.externalOverrides.positionSource
+    if (external !== null) return external
     if (this.faults.gnssLost) {
       return this.visionAvailable ? 'vision' : 'atti'
     }
@@ -1136,6 +1242,8 @@ export class DroneSim {
 
   /** 切飞行挡位:'cine' 平稳 / 'normal' 普通 / 'sport' 运动(影响限速与倾角) */
   setMode(mode: FlightMode): void {
+    // 外部接管时挡位由真飞控决定,面板的切换请求转成 MAV_CMD_DO_SET_MODE
+    if (this.dispatchExternal({ type: 'mode', mode })) return
     if (this.mode === mode) return
     this.mode = mode
     this.pushEvent('info', `切换至${FLIGHT_MODES[mode].label}`)
@@ -1144,6 +1252,8 @@ export class DroneSim {
   /** 写摇杆连续量(Partial 合并;松杆由飞控刹停并定点悬停) */
   setStick(stick: Partial<StickState>): void {
     this.stick = { ...this.stick, ...stick }
+    // 外部接管时摇杆要真发给飞控,否则只有面板上的杆子图形在动
+    this.external?.stick?.(this.stick)
   }
 
   /** 内八掰杆启动电机(地面待机时可用) */
@@ -1170,6 +1280,8 @@ export class DroneSim {
 
   /** 起飞:记录返航点并自动爬升到 1.2 米(需已启动电机) */
   takeOff(): boolean {
+    // 外部接管:交给真飞控(MAV_CMD_COMPONENT_ARM_DISARM + NAV_TAKEOFF)
+    if (this.dispatchExternal({ type: 'takeoff' })) return true
     if (this.phase !== 'motorsOn') return false
     this.phase = 'takingOff'
     this.phaseTime = 0
@@ -1182,12 +1294,14 @@ export class DroneSim {
 
   /** 一键起飞(地面待机时自动完成电机启动 + 起飞) */
   autoTakeOff(): boolean {
+    if (this.dispatchExternal({ type: 'takeoff' })) return true
     if (this.phase === 'standby' && !this.startMotors()) return false
     return this.takeOff()
   }
 
   /** 触发自动降落(会先中止正在执行的航线任务) */
   startLanding(): boolean {
+    if (this.dispatchExternal({ type: 'land' })) return true
     if (!this.airborne && this.phase !== 'takingOff') return false
     if (this.phase === 'landing' || this.phase === 'emergency') return false
     this.abortMission('触发自动降落')
@@ -1203,6 +1317,7 @@ export class DroneSim {
 
   /** 触发智能返航(reason 用于日志与快照);返航优先级高于航线,会中止任务 */
   startRth(reason: string): boolean {
+    if (this.dispatchExternal({ type: 'rth', reason })) return true
     if (!this.airborne) return false
     if (this.phase === 'rth') return false
     // 返航优先级高于航线任务:真机触发返航会同时中止未完成的航线
@@ -1244,6 +1359,7 @@ export class DroneSim {
 
   /** 重置到可再次起飞的状态(用于沙盒反复测试) */
   reset(): void {
+    this.missionWaypointHold = null
     this.phase = 'powerOff'
     this.position = { x: 0, y: 0, z: 0 }
     this.velocity = { x: 0, y: 0, z: 0 }
@@ -1274,6 +1390,167 @@ export class DroneSim {
     this.pushEvent('info', '沙盒已重置')
   }
 
+  // ————————————————————————————— 外部状态源 —————————————————————————————
+
+  /**
+   * 接管:交给外部源提供真值(MAVLink / SITL / 日志回放)。
+   *
+   * 接管后 `step()` 不再跑状态机、飞行积分、电池模型与失效保护 —— 那些归真飞控管。
+   * 但**本类依然是所有界面的唯一数据源**:控制面板、航线面板、鹰眼图、采集服务读的
+   * 仍是 `sim.*`,所以两套渲染后端与全部面板代码一行都不用改。
+   */
+  attachExternalSource(source: ExternalFlightSource): void {
+    this.external = source
+    this.externalOverrides = {
+      batteryPercent: null,
+      batteryVoltage: null,
+      batteryCurrent: null,
+      modeLabel: null,
+      positionSource: null,
+    }
+    this.events = []
+    this.pushEvent('info', '已接管外部状态源（MAVLink / SITL）：飞控逻辑由外部提供')
+  }
+
+  /**
+   * 解除接管,回到本类自己飞(位置/姿态保持当前值,不会跳回原点)。
+   *
+   * 恢复的 phase 必须由**当前高度**决定:外部源很可能把飞机带到了几十米高,
+   * 这时直接塞 `standby` 会让桨停转、机体悬在半空且起飞按钮永久不可用。
+   * 所以空中 → `flying`(继续悬停,可降落/返航),地面 → `standby`(回到待机)。
+   */
+  detachExternalSource(): void {
+    if (!this.external) return
+    this.external = null
+    this.externalOverrides = {
+      batteryPercent: null,
+      batteryVoltage: null,
+      batteryCurrent: null,
+      modeLabel: null,
+      positionSource: null,
+    }
+    this.velocity = { x: 0, y: 0, z: 0 }
+    // 外部姿态是飞控算出来的,交接后由本类重新积分,先从水平姿态起步
+    this.tiltPitch = 0
+    this.tiltRoll = 0
+    this.tiltPitchTarget = 0
+    this.tiltRollTarget = 0
+    this.rcLinkQuality = 1
+    // 航线的执行权属于飞控,交接时进度作废(航点本身仍留在 sim.mission 里,可重新执行)
+    this.missionStatus = 'idle'
+    this.missionStage = 'idle'
+    this.missionPending = false
+    this.missionIndex = -1
+
+    const airborne = this.position.y > 0.05
+    if (airborne) {
+      this.phase = 'flying'
+      // 桨已经在转:保持怠速以上,切换瞬间不会出现"空中停桨"的假象
+      this.motorLoad = Math.max(this.motorLoad, 0.32)
+      if (!this.homeRecorded) {
+        this.home = { x: this.position.x, z: this.position.z }
+        this.homeRecorded = true
+      }
+    } else {
+      this.position.y = 0
+      this.phase = 'standby'
+      this.motorLoad = 0
+    }
+    this.phaseTime = 0
+    this.pushEvent(
+      'info',
+      airborne
+        ? `已解除外部状态源，内置模型在 ${this.position.y.toFixed(1)} m 处接管悬停`
+        : '已解除外部状态源，恢复内置飞控模型',
+    )
+  }
+
+  /**
+   * 把面板指令转交给外部源。返回 true 表示已被接管(调用方不要再走内置逻辑)。
+   * 没有外部源时返回 false —— 于是面板按钮在两种模式下走同一条调用路径。
+   */
+  dispatchExternal(command: ExternalCommand): boolean {
+    if (!this.external) return false
+    this.external.command?.(command)
+    return true
+  }
+
+  /**
+   * 写入一帧外部状态。`deltaSeconds` 只在源没给速度时用于位置差分。
+   *
+   * 这是整个接入层唯一的状态写入口 —— 无论数据来自 WebSocket、UDP 还是日志回放,
+   * 都收敛到这里,保证「换了数据源,画面行为一致」。
+   */
+  applyExternalState(state: ExternalFlightState, deltaSeconds = 0): void {
+    const previous = this.position
+    const next = state.position
+    if (state.velocity) {
+      this.velocity = { ...state.velocity }
+    } else if (deltaSeconds > 0) {
+      this.velocity = {
+        x: (next.x - previous.x) / deltaSeconds,
+        y: (next.y - previous.y) / deltaSeconds,
+        z: (next.z - previous.z) / deltaSeconds,
+      }
+    }
+    this.position = { x: next.x, y: next.y, z: next.z }
+    this.heading = normalizeHeading(state.heading)
+    // 真机倾角远小于 45°,但不同机型差异大,这里只做安全夹取而不做机型标定
+    this.tiltPitch = clamp(state.tiltPitch, -60, 60)
+    this.tiltRoll = clamp(state.tiltRoll, -60, 60)
+    this.tiltPitchTarget = this.tiltPitch
+    this.tiltRollTarget = this.tiltRoll
+    if (state.phase !== this.phase) {
+      this.phase = state.phase
+      this.phaseTime = 0
+    }
+    if (state.motorLoad !== undefined) this.motorLoad = clamp(state.motorLoad, 0, 1)
+    // MAVLink 不提供逐桨转速(要另订 SERVO_OUTPUT_RAW),四桨同速即可看到桨在转
+    const spin = this.airborne ? Math.max(this.motorLoad, 0.05) : this.motorLoad
+    this.motorSpeeds = {
+      FrontLeft: spin,
+      FrontRight: spin,
+      RearLeft: spin,
+      RearRight: spin,
+    }
+    if (state.gimbalPitch !== undefined) {
+      this.gimbalPitch = clamp(state.gimbalPitch, DRONE_SPEC.gimbalPitchMin, DRONE_SPEC.gimbalPitchMax)
+    }
+    if (state.gimbalYaw !== undefined) this.gimbalYaw = state.gimbalYaw
+    this.externalOverrides.batteryPercent = state.batteryPercent ?? null
+    this.externalOverrides.batteryVoltage = state.batteryVoltage ?? null
+    this.externalOverrides.batteryCurrent = state.batteryCurrent ?? null
+    // 卫星数是个真实字段(预检 / 定位来源都要读它),直接写,不走覆盖表
+    if (state.satellites !== undefined) this.satellites = Math.round(state.satellites)
+    this.externalOverrides.modeLabel = state.modeLabel ?? null
+    this.externalOverrides.positionSource = state.positionSource ?? null
+    // 航线进度:面板的航点高亮/进度条读的是 missionIndex + missionStatus,
+    // 外部模式下两者都由 MISSION_CURRENT 推导
+    if (state.missionIndex !== undefined) {
+      this.missionIndex = state.missionIndex
+      if (state.missionIndex < 0) {
+        this.missionStatus = 'idle'
+        this.missionStage = 'idle'
+      } else {
+        this.missionStatus = state.phase === 'waypoint' ? 'running' : 'paused'
+        this.missionStage = 'goto'
+      }
+    }
+    if (this.airborne) this.altitudeMax = Math.max(this.altitudeMax, this.position.y)
+  }
+
+  /** 外部模式下的每帧推进:只做时间与相机,不碰飞行状态 */
+  private stepExternal(delta: number): void {
+    const source = this.external
+    if (!source) return
+    const state = source.read()
+    if (state) this.applyExternalState(state, delta)
+    // 链路健康度直接反映在面板的遥控信号格上:掉线时归零,肉眼可见
+    this.rcLinkQuality = source.online() ? 1 : 0
+    if (this.airborne) this.flightTime += delta
+    this.updateCamera(delta)
+  }
+
   // ————————————————————————————— 每帧推进 —————————————————————————————
 
   /** 推进一个仿真时间片(dtSeconds 秒;负值不推进,过大的值会被夹到单步上限) */
@@ -1285,6 +1562,12 @@ export class DroneSim {
     this.phaseTime += delta
     // 录像计时与电源状态无关(相机录制本身由引擎层的 MediaRecorder 负责)
     if (this.recording) this.recordSeconds += delta
+
+    // 外部接管:飞控在外部,本类只负责把遥测落到界面状态上
+    if (this.external) {
+      this.stepExternal(delta)
+      return
+    }
 
     if (this.phase === 'powerOff') {
       this.motorLoad = lerp(this.motorLoad, 0, Math.min(1, delta * 6))
@@ -1935,6 +2218,8 @@ export class DroneSim {
    * - 姿态模式(无定位)拒绝执行 —— 航点任务依赖 GNSS,真机同样如此。
    */
   startMission(): boolean {
+    // 外部接管:航线上传 + MAV_CMD_DO_SET_MODE(AUTO.MISSION)由接入层完成
+    if (this.dispatchExternal({ type: 'missionStart' })) return true
     if (this.missionStatus !== 'idle' || this.missionPending) return false
     if (this.mission.length === 0) {
       this.pushEvent('error', '航线任务启动失败:航点列表为空')
@@ -1980,6 +2265,7 @@ export class DroneSim {
    * 垂直调整到首航点高度 → 水平飞过去 → 高度收尾 → 对准航线方向,然后才开始推航点。
    */
   private beginMissionPath(): void {
+    this.missionWaypointHold = null
     this.missionPending = false
     this.missionStatus = 'running'
     this.missionIndex = 0
@@ -2005,10 +2291,13 @@ export class DroneSim {
 
   /** 暂停任务:交回手动控制并原地悬停,航点进度保留 */
   pauseMission(reason = '用户暂停'): boolean {
+    // 外部接管:MAV_CMD_DO_PAUSE_CONTINUE(193) param1=0
+    if (this.dispatchExternal({ type: 'missionPause' })) return true
     if (this.missionStatus !== 'running') return false
     this.missionStatus = 'paused'
     this.missionPauseReason = reason
     this.missionPausedStage = this.missionStage
+    this.missionWaypointHold = null
     this.velocity = { x: 0, y: 0, z: 0 }
     if (this.phase === 'waypoint') this.phase = 'flying'
     this.pushEvent('warn', `航线任务已暂停(${reason}),可手动接管;点「继续」回到当前航点`)
@@ -2017,6 +2306,8 @@ export class DroneSim {
 
   /** 继续任务:回到当前目标航点(首航点还没走完启航段的话接着走) */
   resumeMission(): boolean {
+    // 外部接管:MAV_CMD_DO_PAUSE_CONTINUE(193) param1=1
+    if (this.dispatchExternal({ type: 'missionResume' })) return true
     if (this.missionStatus !== 'paused') return false
     this.missionStatus = 'running'
     this.missionPauseReason = ''
@@ -2033,6 +2324,8 @@ export class DroneSim {
 
   /** 停止任务:飞机原地悬停,航线归零(真机"停止任务"不返航) */
   stopMission(reason = '用户停止'): boolean {
+    // 外部接管:切成 LOITER(停止任务但留在原地,与内置语义一致)
+    if (this.dispatchExternal({ type: 'missionStop' })) return true
     if (this.missionStatus === 'idle' && !this.missionPending) return false
     this.missionPending = false
     this.abortMission(reason)
@@ -2045,6 +2338,7 @@ export class DroneSim {
 
   /** 中止任务(内部使用:返航/降落等更高优先级动作会走到这里) */
   private abortMission(reason: string): void {
+    this.missionWaypointHold = null
     if (this.missionStatus === 'idle' && !this.missionPending) return
     this.missionStatus = 'idle'
     this.missionIndex = -1
@@ -2127,8 +2421,21 @@ export class DroneSim {
       this.velocity.x = lerp(this.velocity.x, 0, Math.min(1, delta * 4))
       this.velocity.z = lerp(this.velocity.z, 0, Math.min(1, delta * 4))
       this.velocity.y = lerp(this.velocity.y, 0, Math.min(1, delta * 2))
-      this.missionHoverTimer += delta
-      if (this.missionHoverTimer >= waypoint.hoverSeconds) this.advanceMission()
+      // 测绘任务在悬停点也允许使用独立的机体自转通道。
+      // `ObliqueSurveyRunner` 借此把机体转到每个倾斜取景的目标航向，
+      // 不改变航点位置，也不把云台 Pan 误当成 180° 机体转向。
+      if (this.spinHeading !== null) {
+        this.heading = this.turnToward(
+          this.heading,
+          this.spinHeading,
+          this.spinRateDeg * this.speedScale * delta,
+        )
+      }
+      // 异步成像不能用固定悬停秒数代替；渲染帧慢时也必须等到采集方释放。
+      if (this.missionWaypointHold?.index !== this.missionIndex) {
+        this.missionHoverTimer += delta
+        if (this.missionHoverTimer >= waypoint.hoverSeconds) this.advanceMission()
+      }
       if (this.phase !== 'waypoint') return
       this.integratePosition(delta)
       return
@@ -2352,6 +2659,22 @@ export class DroneSim {
     return radToDeg(Math.atan2(dx, -dz))
   }
 
+  /** 同步到点通知，在物理子步内触发，避免一帧推进多步时漏掉拍摄点。 */
+  subscribeMissionArrival(listener: (index: number) => void): () => void {
+    this.missionArrivalListeners.add(listener)
+    return () => this.missionArrivalListeners.delete(listener)
+  }
+
+  /** 保持当前悬停航点，返回幂等的释放函数。暂停/停止仍由飞控决定。 */
+  holdMissionWaypoint(index: number): () => void {
+    if (this.external || this.missionIndex !== index || this.missionStage !== 'hover') return () => {}
+    const hold = { index }
+    this.missionWaypointHold = hold
+    return () => {
+      if (this.missionWaypointHold === hold) this.missionWaypointHold = null
+    }
+  }
+
   /** 到点:执行航点动作(云台 / 拍照 / 悬停),然后飞下一个点 */
   private arriveWaypoint(): void {
     const waypoint = this.mission[this.missionIndex]
@@ -2376,6 +2699,7 @@ export class DroneSim {
     this.missionHoverTimer = 0
     this.position.y = waypoint.altitude
     this.velocity = { x: 0, y: 0, z: 0 }
+    for (const listener of this.missionArrivalListeners) listener(this.missionIndex)
   }
 
   /** 推进到下一个航点;已到末尾则按结束动作收尾或循环 */
@@ -2399,6 +2723,7 @@ export class DroneSim {
 
   /** 全部航点执行完毕:按配置悬停 / 返航 / 降落 */
   private finishMission(): void {
+    this.missionWaypointHold = null
     const count = this.mission.length
     const passes = this.missionPasses + 1
     const elapsed = this.missionElapsed
@@ -2511,6 +2836,11 @@ export class DroneSim {
       const distancePenalty = clamp(this.distanceToHome / 2000, 0, 0.6)
       this.rcLinkQuality = clamp(1 - distancePenalty, 0.35, 1)
     }
+  }
+
+  /** 可见卫星数(取整后;OSD / 体检读这个,不要直接读私有字段) */
+  get satelliteCount(): number {
+    return Math.round(this.satellites)
   }
 
   /** 水平精度因子(越小越好);无星时返回 99 表示不可用 */
@@ -2816,6 +3146,9 @@ export class DroneSim {
 
   /** 起飞前检查项列表(外部注入项 + 内置项),每次读取即时构造 */
   get checklist(): ChecklistItem[] {
+    // 外部接管时自检由真飞控负责(它有自己的 preflight 与 arming check),
+    // 本类不再伪造检查项 —— 否则面板会拿模型的检查结果去禁用一个真机的起飞按钮
+    if (this.external) return []
     const items: ChecklistItem[] = []
     for (const external of this.externalChecks) items.push(external)
     items.push({
@@ -2970,7 +3303,8 @@ export class DroneSim {
       phase: this.phase,
       phaseLabel: this.phaseLabel,
       mode: this.mode,
-      modeLabel: this.modeSpec.label,
+      // 外部接管时直接显示飞控上报的模式名(POSCTL / AUTO.MISSION / LOITER …)
+      modeLabel: this.modeLabelText,
       speedScale: this.speedScale,
       positionSource: this.positionSource,
       positionSourceLabel: POSITION_SOURCE_LABELS[this.positionSource],

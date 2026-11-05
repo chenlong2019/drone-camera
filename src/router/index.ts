@@ -17,10 +17,28 @@ const router = createRouter({
       meta: { title: '示例页面', menu: true },
     },
     {
+      path: '/digital-campus-demo',
+      name: 'DigitalCampusDemo',
+      component: () => import('../views/digital-campus-demo/digital-campus-demo.vue'),
+      meta: { title: '数字园区无人机测绘', menu: true },
+    },
+    {
+      path: '/panorama-demo',
+      name: 'PanoramaDemo',
+      component: () => import('../views/panorama-demo/panorama-demo.vue'),
+      meta: { title: '360 环视', menu: true },
+    },
+    {
       path: '/cesium-demo',
       name: 'CesiumDemo',
       component: () => import('../views/cesium-demo/cesium-demo.vue'),
       meta: { title: 'Cesium 初始场景', menu: true },
+    },
+    {
+      path: '/amap-demo',
+      name: 'AmapDemo',
+      component: () => import('../views/amap-demo/amap-demo.vue'),
+      meta: { title: '高德地图', menu: true },
     },
     {
       path: '/docs',

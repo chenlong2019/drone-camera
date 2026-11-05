@@ -3,7 +3,8 @@
  *
  * 库里有两套完整的飞行控制器,都实现同一个 `DronePanelHost` 接口:
  *
- *   engine: 'three'  → DroneFly            three.js + WebGPURenderer 的飞行沙盒
+ *   engine: 'three'  → DroneFly            three.js 飞行沙盒(WebGPURenderer 为主,
+ *                                          WebGLRenderer 亦可,见 drone-renderer.ts)
  *   engine: 'cesium' → CesiumDroneAdapter  地球(ENU/ECEF)坐标系下的飞行
  *
  * 两者的差别只在"真值怎么变成画面":飞行内核都是同一个 DroneSim,控制面板 /
@@ -28,7 +29,7 @@
  */
 import type * as THREE from 'three'
 import type { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import type { WebGPURenderer } from 'three/webgpu'
+import type { DroneRendererLike } from './drone-renderer'
 
 import type { DronePanelHost } from './drone-control'
 import { DroneFly, type DroneFlyInitializeOptions } from './drone-fly'
@@ -36,6 +37,10 @@ import { CesiumDroneAdapter, type CesiumDroneOptions } from './drone-cesium'
 
 /** 渲染后端标识 */
 export type DroneEngine = 'three' | 'cesium'
+
+/** 渲染器契约与后端判别,转出给使用方(不必再深 import) */
+export type { DroneRendererLike, DroneRendererKind } from './drone-renderer'
+export { rendererKindOf } from './drone-renderer'
 
 /**
  * three 后端参数:场景四件套 + `DroneFly.initialize()` 的全部选项
@@ -46,7 +51,8 @@ export interface ThreeDroneEngineOptions extends DroneFlyInitializeOptions {
   engine?: 'three'
   scene: THREE.Scene<THREE.Object3DEventMap>
   camera: THREE.PerspectiveCamera
-  renderer: WebGPURenderer
+  /** 渲染器:WebGPURenderer(推荐)或 WebGLRenderer,见 drone-renderer.ts 的契约说明 */
+  renderer: DroneRendererLike
   controls?: OrbitControls<THREE.Camera> | null
 }
 

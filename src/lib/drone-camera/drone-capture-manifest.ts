@@ -314,7 +314,7 @@ function coordinateFrameFromSession(
         }
       : {}),
   }
-  const transform = { ...defaultTransform, ...(override?.transform ?? {}) }
+  const transform = { ...defaultTransform, ...override?.transform }
   return {
     world: override?.world ?? (source === 'Cesium ECEF' ? 'Cesium ECEF' : source),
     local: override?.local ?? (source === 'Cesium ECEF' ? 'ENU' : source),

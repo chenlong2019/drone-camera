@@ -5,7 +5,3 @@ import UsePhotogrammetryValidation from '@/components/use-photogrammetry-validat
 <template>
   <UsePhotogrammetryValidation />
 </template>
-
-<style>
-@import url('/Cesium/Widgets/widgets.css');
-</style>

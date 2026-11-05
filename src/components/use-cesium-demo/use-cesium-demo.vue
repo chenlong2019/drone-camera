@@ -7,6 +7,9 @@ const container = ref<HTMLElement | null>(null)
 const modelLabel = ref('加载中…')
 const geoText = ref('')
 const phaseText = ref('')
+const sourceLabel = ref('内置飞控')
+const sourceLinked = ref(false)
+const sourceBusy = ref(false)
 let demo: CesiumDemoApi | undefined
 let timer: number | null = null
 
@@ -18,11 +21,22 @@ function refresh(): void {
     geo?: { lon: number; lat: number; height: number }
     phase?: string
     altitude?: number
+    flightSource?: 'internal' | 'mavlink'
+    mavlink?: { connected?: boolean; autopilot?: string; mode?: string } | null
   }
   if (!s.ready || !s.geo) return
   modelLabel.value = s.modelLabel ?? ''
   geoText.value = `${s.geo.lat.toFixed(5)}, ${s.geo.lon.toFixed(5)} · ${s.geo.height.toFixed(1)} m`
   phaseText.value = `${s.phase ?? ''} · 相对起飞点 ${(s.altitude ?? 0).toFixed(1)} m`
+  // 飞控源:内置模型显示「内置飞控」,外部链路显示「PX4 · POSCTL」并由灯色表示通断
+  if (s.flightSource === 'mavlink') {
+    const name = s.mavlink?.autopilot || 'PX4'
+    sourceLabel.value = s.mavlink?.connected ? `${name} · ${s.mavlink.mode ?? ''}` : `${name} · 等待遥测`
+    sourceLinked.value = s.mavlink?.connected === true
+  } else {
+    sourceLabel.value = '内置飞控'
+    sourceLinked.value = false
+  }
 }
 
 onMounted(async () => {
@@ -43,6 +57,23 @@ function switchModel(): void {
   demo?.cycleModel()
   refresh()
 }
+
+/** 飞控源热切换:内置模型 ⇄ PX4 / SITL(切换不重建场景) */
+async function toggleSource(): Promise<void> {
+  if (!demo || sourceBusy.value) return
+  sourceBusy.value = true
+  try {
+    const current = demo.getFlightSource()
+    if (current.kind === 'mavlink') await demo.setFlightSource('internal')
+    else await demo.setFlightSource('mavlink')
+  } catch (error) {
+    // 库内部已回退内置模型;把原因直接压到状态行上,不用额外弹窗
+    phaseText.value = error instanceof Error ? `接入 PX4 失败:${error.message}` : '接入 PX4 失败'
+  } finally {
+    sourceBusy.value = false
+    refresh()
+  }
+}
 </script>
 
 <template>
@@ -56,6 +87,15 @@ function switchModel(): void {
         <small class="mono">{{ geoText }}</small>
         <small class="mono">{{ phaseText }}</small>
       </div>
+      <button
+        class="model-switch source-switch"
+        :class="{ 'is-linked': sourceLinked }"
+        type="button"
+        :disabled="sourceBusy"
+        @click="toggleSource"
+      >
+        {{ sourceBusy ? '连接中…' : sourceLabel }}
+      </button>
       <button class="model-switch" type="button" @click="switchModel">切换机体</button>
       <RouterLink class="validation-link" to="/photogrammetry-validation">验证采集</RouterLink>
     </div>
@@ -121,6 +161,8 @@ function switchModel(): void {
   flex: none;
   margin-left: 6px;
   padding: 6px 12px;
+  /* 模式名(PX4 · AUTO.MISSION 之类)长度随飞控变化,不允许被状态卡挤压截断 */
+  white-space: nowrap;
   color: #d6ecff;
   background: rgb(31 74 107 / 78%);
   border: 1px solid rgb(111 190 255 / 45%);
@@ -129,8 +171,19 @@ function switchModel(): void {
   cursor: pointer;
 }
 
-.model-switch:hover {
+.model-switch:hover:not(:disabled) {
   background: rgb(43 98 140 / 88%);
+}
+
+.model-switch:disabled {
+  cursor: progress;
+  opacity: 0.75;
+}
+
+/* 外部飞控在线:灯色转绿,和 three 页的语义保持一致 */
+.source-switch.is-linked {
+  border-color: rgb(81 227 164 / 65%);
+  color: #b6ffe0;
 }
 
 .validation-link {
