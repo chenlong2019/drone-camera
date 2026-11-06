@@ -142,3 +142,27 @@ test('preparing an existing task never resets its checkpoint', (t) => {
   assert.throws(() => agent.prepare(task()), /EEXIST/)
   assert.equal(agent.status('test-task').status, 'prepared')
 })
+
+test('failed remote registration preserves the receipt and does not retry the shutter', async (t) => {
+  const { agent, options, calls, dir } = fixture(t)
+  agent.onReceipt = async () => { throw new Error('upload response lost') }
+  await assert.rejects(agent.run('test-task'), /upload response lost/)
+  assert.deepEqual(calls, ['shot-0'])
+  assert.equal(agent.load('test-task').attempts['shot-0'], 1)
+  const original = readFileSync(path.join(dir, 'images/shot-0.png'))
+  const registered = []
+  const resumed = new CaptureAgent({ ...options, onReceipt: async (receipt) => registered.push(receipt.image.id) })
+  await resumed.run('test-task')
+  assert.deepEqual(registered, ['shot-0', 'shot-1', 'shot-2'])
+  assert.deepEqual(calls, ['shot-0', 'shot-1', 'shot-2'])
+  assert.deepEqual(readFileSync(path.join(dir, 'images/shot-0.png')), original)
+})
+
+test('new browser executions identify simulation clock resets without altering elapsed time', async (t) => {
+  const { agent, options, dir } = fixture(t)
+  await agent.run('test-task', { maxShots: 1 })
+  await new CaptureAgent(options).run('test-task')
+  const receipts = [0, 1, 2].map((i) => JSON.parse(readFileSync(path.join(dir, 'receipts', `shot-${i}.json`))))
+  assert.notEqual(receipts[0].simulationSessionId, receipts[1].simulationSessionId)
+  assert.equal(receipts[1].simulationSessionId, receipts[2].simulationSessionId)
+})

@@ -65,7 +65,29 @@ agent-runs/<taskId>/
 
 ZIP 内的图片由现有打包器统一重命名，内部 manifest 与 images.txt 使用相同路径。`points3D.txt` 暂为空：这是带已知相机位姿的采集包，后续需要特征匹配、三角化才能提供 3DGS 初始化点云。
 
-任务产物不提交 Git。原始回执能追溯计划拍点与相机数据；任务报告保留失败原因。共享 PG/对象存储和 neural-render-service 接入是独立的后续适配器，本版先验证本地恢复闭环。
+任务产物不提交 Git。原始回执能追溯计划拍点与相机数据；任务报告保留失败原因。平台接入已通过独立的 HTTP 执行端实现，见下节。
+
+## 平台任务执行端
+
+```powershell
+# 在另一个终端先启动 digital-pwin-platform/services/neural-render-service。
+npm run agent:worker -- --url http://127.0.0.1:8090
+
+# 单次领取任务，新增一张后暂停。之后在平台页面点击继续。
+npm run agent:worker -- --url http://127.0.0.1:8090 --once --max-shots 1
+```
+
+平台 `/capture-tasks` 页面创建任务、展示照片与进度并控制暂停/恢复。执行端主动领取有界采集计划，不需要平台连接本机的端口。该入口不修改 MCP 工具名称和本地 CLI 的行为。
+
+`platform-worker.mjs` 负责任务领取、租约续期、暂停指令、逐张上传和最终完成回传；`platform-client.mjs` 负责 HTTP 重试、原始回执适配和 ENU → 平台坐标转换。`runtime.mjs` 的 `onReceipt` 在本地文件提交后调用，上传失败保留已拍照片，不重试快门。
+
+默认目录为 `agent-runs/platform/<服务地址哈希>/`，可通过 `--root` 指定。默认执行端 ID 由主机名与该目录生成，支持 `--worker-id` 固定指定。任务首次领取后绑定执行端，重启时保持相同服务地址、ID 和目录。任务根目录有进程锁；服务租约为 60 秒，约每 10 秒续期，过期进程不能回传结果。
+
+恢复时先读取平台清单，再复用本地回执；平台已有照片但本地文件丢失时，核对来源回执和 SHA-256 后下载恢复。每帧 ID 来自任务/拍点哈希，完全相同的上传可重试，冲突上传拒绝覆盖。完成后服务验证全部计划帧并封存为 ready。原始 COLMAP ZIP 保留在执行端。
+
+位置从 ENU `[东,北,上]` 转为平台 `[东,上,南]`，四元数同时转换世界坐标基。保留原始回执以及真实 `observation.elapsed`，用 `simulationSessionId` 标记浏览器重启造成的仿真时钟归零。
+
+完整启动和接口说明见 [平台接入文档](https://github.com/chenlong2019/digital-pwin-platform/blob/main/docs/architecture/capture-agent-integration.md)。在平台仓库执行 `npm run capture:verify`，可验证真实网页下发、首张暂停、服务与执行进程重启、远端文件恢复、三张实图入库和数据集封存。当前联调使用 SQLite，PostgreSQL 实际隧道、对象存储和训练工作进程仍待接入验证。
 
 ## MCP
 

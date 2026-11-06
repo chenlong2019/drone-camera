@@ -13,6 +13,7 @@
 | 采集会话导出 | `drone_sessions`、`drone_session_export`、`drone_session_photos` | 已有 MCP；浏览器内存会话本身不跨进程保存 |
 | 关闭手动会话 | `drone_shutdown` | 已有 MCP |
 | 可恢复任务 | `agent_prepare/run/status/pause/validate` | 本次新增 MCP + CLI；磁盘检查点与逐张回执 |
+| 平台任务执行 | `npm run agent:worker -- --url http://127.0.0.1:8090` | HTTP 主动领取、心跳、逐张登记和断点续传；独立 CLI，未额外注册 MCP 名称 |
 | 航点执行 | `DroneFly.setMission/startMission/getMissionSnapshot` | 已有库 API；Agent 内部调用并检查到位 |
 | 网格/环绕规划 | `planObliqueSurvey`、`planReconCapture` | 已有库 API；V1 Agent 接收显式拍点，尚未自动调用规划器 |
 | 数据清单校验 | `buildCaptureManifest`、`validateCaptureManifest` | 已有库 API；Agent 直接复用 |

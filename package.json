@@ -26,6 +26,7 @@
     "agent": "node agent/cli.mjs",
     "agent:test": "node --test agent/tests/*.test.mjs",
     "agent:verify": "node agent/verify.mjs",
+    "agent:worker": "node agent/platform-worker.mjs",
     "video:relay": "node video-link/relay.mjs",
     "video:relay:local": "node video-link/relay.mjs --host 127.0.0.1"
   },

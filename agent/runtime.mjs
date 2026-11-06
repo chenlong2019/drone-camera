@@ -45,8 +45,8 @@ export function sceneVersion() {
   return digest(parts.join('\n'))
 }
 
-function acquire(dir) {
-  const file = path.join(dir, 'run.lock')
+export function acquire(dir, name = 'run.lock') {
+  const file = path.join(dir, name)
   const token = randomUUID()
   try {
     const fd = openSync(file, 'wx')
@@ -58,17 +58,18 @@ function acquire(dir) {
     try { process.kill(owner.pid, 0) } catch (e) { if (e.code === 'ESRCH') alive = false; else throw e }
     if (alive) throw new Error(`Task already running (pid ${owner.pid})`)
     unlinkSync(file)
-    return acquire(dir)
+    return acquire(dir, name)
   }
   return () => { if (existsSync(file) && jsonRead(file).token === token) unlinkSync(file) }
 }
 
 export class CaptureAgent {
-  constructor({ root = RUNS_ROOT, toolsFactory = () => new SimulationTools(), fingerprint = sceneVersion, onProgress = () => {} } = {}) {
+  constructor({ root = RUNS_ROOT, toolsFactory = () => new SimulationTools(), fingerprint = sceneVersion, onProgress = () => {}, onReceipt = async () => {} } = {}) {
     this.root = path.resolve(root)
     this.toolsFactory = toolsFactory
     this.fingerprint = fingerprint
     this.onProgress = onProgress
+    this.onReceipt = onReceipt
   }
   directory(taskId) { return path.join(this.root, safeId(taskId)) }
   prepare(input) {
@@ -140,7 +141,7 @@ export class CaptureAgent {
   async run(taskId, { maxShots = Infinity, signal } = {}) {
     if (maxShots !== Infinity && (!Number.isInteger(maxShots) || maxShots < 1 || maxShots > 200)) throw new Error('maxShots must be 1–200')
     const dir = this.directory(taskId), release = acquire(dir)
-    let tools, state
+    let tools, state, simulationSessionId
     try {
       state = this.load(taskId)
       if (state.sceneVersion !== this.fingerprint()) throw new Error('Rendering sources changed; create a new task to avoid mixing scenes')
@@ -158,6 +159,7 @@ export class CaptureAgent {
       state.artifacts = null
       this.checkpoint(dir, state, 'running')
       this.event(dir, 'resume', { reused: receipts.size, total: state.task.shots.length })
+      for (const receipt of receipts.values()) await this.onReceipt(receipt, state)
       let captured = 0
       for (const shot of state.task.shots) {
         if (receipts.has(shot.id)) continue
@@ -171,7 +173,7 @@ export class CaptureAgent {
           this.checkpoint(dir, state)
           this.event(dir, 'capture-start', { shotId: shot.id, attempt })
           try {
-            if (!tools) { tools = this.toolsFactory(); await tools.prepare() }
+            if (!tools) { tools = this.toolsFactory(); await tools.prepare(); simulationSessionId = randomUUID() }
             await tools.navigate(shot)
             const result = await tools.capture(shot, state.sceneVersion)
             const bytes = Buffer.from(result.dataUrl.replace(/^data:image\/png;base64,/, ''), 'base64')
@@ -182,7 +184,7 @@ export class CaptureAgent {
             if (Math.hypot(...measured.bodyPositionEnu.map((v, i) => v - shot.positionEnu[i])) > 0.75 ||
                 Math.abs(((measured.heading - shot.heading + 540) % 360) - 180) > 1 || Math.abs(measured.gimbalPitch - shot.pitch) > 1) throw new Error('Aircraft did not reach requested capture pose')
             const entry = { taskHash: state.taskHash, sceneVersion: state.sceneVersion, camera: result.manifest.camera, image,
-              observation: measured, shot, capturedAt: timestamp() }
+              observation: measured, simulationSessionId, shot, capturedAt: timestamp() }
             const validation = validateCaptureManifest(this.manifest(state, [...receipts.values(), entry]))
             if (!validation.valid) throw new Error(validation.errors.map((i) => `${i.code}: ${i.message}`).join('; '))
             atomicWrite(path.join(dir, image.file), bytes)
@@ -201,6 +203,8 @@ export class CaptureAgent {
           }
         }
         if (!accepted) throw new Error(`Capture failed: ${shot.id}`)
+        // Upload errors happen after the local commit and must never retry the shutter.
+        await this.onReceipt(receipts.get(shot.id), state)
       }
       const ordered = state.task.shots.map((s) => receipts.get(s.id))
       const manifest = this.manifest(state, ordered)
