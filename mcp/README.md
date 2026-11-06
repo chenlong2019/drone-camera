@@ -1,5 +1,8 @@
 # drone-camera 无头模式 / MCP
 
+可恢复的采集任务现已提供 `agent_prepare/run/status/pause/validate` 五个工具。
+详见 [采集 Agent](../agent/README.md) 和 [工具盘点](../agent/TOOLS.md)。原有 14 个 `drone_*` 工具继续保留。
+
 把无人机控制系统(飞行 + 采集 + 全景 + 球面查看)变成 **AI 可直接调用** 的能力。
 与 Blender 同构:`blender --background --python script.py` 在这里是
 `node mcp/drone-cli.mjs run task.json`;AI 客户端则通过 MCP 协议调用同名工具。

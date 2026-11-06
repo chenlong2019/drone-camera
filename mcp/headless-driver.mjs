@@ -135,6 +135,7 @@ export class HeadlessDrone {
   constructor(options = {}) {
     this.idleMs = options.idleMs ?? 600000
     this.viewport = options.viewport ?? { width: 1280, height: 800 }
+    this.pagePath = options.pagePath ?? '/three-demo?model=husky'
     this.server = null
     this.serverPort = 0
     this.browser = null
@@ -160,14 +161,16 @@ export class HeadlessDrone {
     this.serverPort = port
     this.server = spawn(
       process.execPath,
-      [path.join('node_modules', 'vite', 'bin', 'vite.js'), '--port', String(port), '--strictPort'],
+      [path.join('node_modules', 'vite', 'bin', 'vite.js'), '--host', '127.0.0.1', '--port', String(port), '--strictPort'],
       {
         cwd: ROOT,
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',
+        windowsHide: true,
       },
     )
     this.server.stderr?.on('data', (d) => process.stderr.write(`[vite] ${d}`))
+    this.server.stdout?.resume()
     await this.waitServer(port)
 
     const executablePath = findChrome() ?? undefined
@@ -177,7 +180,7 @@ export class HeadlessDrone {
       this.pageErrors.push(String(err.message).slice(0, 300))
       if (this.pageErrors.length > 20) this.pageErrors.shift()
     })
-    await this.page.goto(`http://127.0.0.1:${port}/three-demo?model=husky`)
+    await this.page.goto(`http://127.0.0.1:${port}${this.pagePath}`)
     await this.page.waitForFunction(() => window.__droneDemo?.captureService, null, {
       timeout: PAGE_READY_TIMEOUT_MS,
     })
@@ -239,6 +242,9 @@ export class HeadlessDrone {
         const result = await withTimeout(this.dispatch(command), timeoutMs, `命令超时(${timeoutMs}ms)`)
         return { ok: true, cmd: command.cmd, ms: Date.now() - started, ...result }
       } catch (err) {
+        // A timeout alone does not cancel page work. Close the page before releasing
+        // the serial queue so a late capture cannot overlap the next command.
+        await this.teardown()
         return {
           ok: false,
           cmd: command.cmd,

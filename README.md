@@ -2,6 +2,8 @@
 
 # drone-camera
 
+Recoverable capture Agent: [run a structured collection task, pause/resume, validate and export a COLMAP bundle](agent/README.md). [Callable tool inventory](agent/TOOLS.md).
+
 **A framework-agnostic drone control library for the browser — one flight core, two renderers (three.js & CesiumJS).**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)

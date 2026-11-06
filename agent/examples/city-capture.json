@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "taskId": "city-capture-demo",
+  "sceneId": "three-demo-city-webgl-husky-v1",
+  "maxAttempts": 2,
+  "shots": [
+    { "id": "view-01", "positionEnu": [0, 0, 6], "heading": 0, "pitch": -25 },
+    { "id": "view-02", "positionEnu": [2, 0, 6], "heading": 350, "pitch": -25 },
+    { "id": "view-03", "positionEnu": [4, 0, 6], "heading": 340, "pitch": -25 }
+  ]
+}

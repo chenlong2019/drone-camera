@@ -23,6 +23,9 @@
     "lint:eslint": "eslint . --fix --cache",
     "format": "prettier --write --experimental-cli src/",
     "colmap:inspect": "node scripts/colmap-to-splat.mjs",
+    "agent": "node agent/cli.mjs",
+    "agent:test": "node --test agent/tests/*.test.mjs",
+    "agent:verify": "node agent/verify.mjs",
     "video:relay": "node video-link/relay.mjs",
     "video:relay:local": "node video-link/relay.mjs --host 127.0.0.1"
   },

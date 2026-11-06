@@ -2,6 +2,8 @@
 
 # drone-camera
 
+新增：[可恢复的采集 Agent](agent/README.md) · [可调用工具盘点](agent/TOOLS.md)。支持结构化计划、暂停恢复、数据校验与 COLMAP 数据包导出。
+
 **与框架无关的浏览器无人机控制系统库 —— 同一套飞控内核，双渲染后端（three.js & CesiumJS）。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)

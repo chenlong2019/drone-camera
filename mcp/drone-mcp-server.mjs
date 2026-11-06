@@ -16,7 +16,8 @@
  */
 import { createInterface } from 'node:readline'
 import { readFileSync } from 'node:fs'
-import { runCommand } from './headless-driver.mjs'
+import { driver, runCommand } from './headless-driver.mjs'
+import { AGENT_TOOLS, callAgentTool, shutdownAgent } from '../agent/tools.mjs'
 
 const SERVER_INFO = { name: 'drone-camera', version: '1.0.0' }
 const PROTOCOL_VERSION = '2024-11-05'
@@ -192,9 +193,13 @@ async function handleRequest(message) {
     case 'ping':
       return {}
     case 'tools/list':
-      return { tools: TOOLS }
+      return { tools: [...TOOLS, ...AGENT_TOOLS] }
     case 'tools/call': {
       const name = String(params.name ?? '')
+      if (AGENT_TOOLS.some((tool) => tool.name === name)) {
+        const result = await callAgentTool(name, params.arguments ?? {})
+        return toolResult({ ...result, ok: result.valid !== false })
+      }
       const tool = TOOLS.find((t) => t.name === name)
       if (!tool) throw new Error(`未知工具: ${name}`)
       const args = params.arguments ?? {}
@@ -237,5 +242,12 @@ rl.on('line', async (line) => {
   }
 })
 
-rl.on('close', () => process.exit(0))
+async function shutdown() {
+  await shutdownAgent()
+  await driver.teardown()
+  process.exit(0)
+}
+rl.on('close', () => void shutdown())
+process.on('SIGINT', () => void shutdown())
+process.on('SIGTERM', () => void shutdown())
 process.stderr.write(`[drone-mcp] ${SERVER_INFO.name} v${SERVER_INFO.version} 就绪(stdio,等 AI 客户端连接)\n`)
